@@ -1,0 +1,6 @@
+{
+  "name": "FHEM Control Desk",
+  "description": "Mobile Steuerzentrale und Administrationswerkzeug für lokale FHEM-Smart-Home-Server mit Geräte-Steuerung, Readings, Zeitplänen, Event-Monitor und sicherer FHEMWEB-Kommunikation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

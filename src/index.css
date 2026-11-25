@@ -1,0 +1,322 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --font-display: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+    --font-body: 'DM Sans', system-ui, -apple-system, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+    /* Default Theme: Ozeanblau (Light) */
+    --m3-canvas: #F4F6F9;
+    --m3-surface: #FFFFFF;
+    --m3-surface-container: #EDF1F7;
+    --m3-surface-high: #E3E9F2;
+    --m3-outline: #D6DFEB;
+    --accent-primary: #2563EB;
+    --accent-primary-hover: #1D4ED8;
+    --accent-on-primary: #FFFFFF;
+    --accent-container: #DBEAFE;
+    --accent-on-container: #1E40AF;
+    --accent-text: #2563EB;
+    --accent-ring: #3B82F6;
+  }
+
+  .dark {
+    /* Default Theme: Ozeanblau (Dark) */
+    --m3-canvas: #0E1116;
+    --m3-surface: #151A22;
+    --m3-surface-container: #1B222D;
+    --m3-surface-high: #232C3A;
+    --m3-outline: #242D3B;
+    --accent-primary: #2563EB;
+    --accent-primary-hover: #3B82F6;
+    --accent-on-primary: #FFFFFF;
+    --accent-container: #1D3456;
+    --accent-on-container: #DBEAFE;
+    --accent-text: #60A5FA;
+    --accent-ring: #60A5FA;
+  }
+
+  /* Theme: Smaragd (Emerald) */
+  :root[data-theme="emerald"] {
+    --m3-canvas: #F2F7F5;
+    --m3-surface: #FFFFFF;
+    --m3-surface-container: #E7F2EE;
+    --m3-outline: #D2E3DC;
+    --accent-primary: #059669;
+    --accent-primary-hover: #047857;
+    --accent-on-primary: #FFFFFF;
+    --accent-container: #D1FAE5;
+    --accent-on-container: #065F46;
+    --accent-text: #059669;
+    --accent-ring: #10B981;
+  }
+  .dark[data-theme="emerald"] {
+    --m3-canvas: #0B1311;
+    --m3-surface: #121C19;
+    --m3-surface-container: #182622;
+    --m3-outline: #22352F;
+    --accent-primary: #059669;
+    --accent-primary-hover: #10B981;
+    --accent-on-primary: #FFFFFF;
+    --accent-container: #12382D;
+    --accent-on-container: #A7F3D0;
+    --accent-text: #34D399;
+    --accent-ring: #34D399;
+  }
+
+  /* Theme: Bernstein (Amber) */
+  :root[data-theme="amber"] {
+    --m3-canvas: #F8F5F0;
+    --m3-surface: #FFFFFF;
+    --m3-surface-container: #F2ECE2;
+    --m3-outline: #E4D9C8;
+    --accent-primary: #D97706;
+    --accent-primary-hover: #B45309;
+    --accent-on-primary: #FFFFFF;
+    --accent-container: #FEF3C7;
+    --accent-on-container: #92400E;
+    --accent-text: #B45309;
+    --accent-ring: #D97706;
+  }
+  .dark[data-theme="amber"] {
+    --m3-canvas: #13100D;
+    --m3-surface: #1B1713;
+    --m3-surface-container: #241F19;
+    --m3-outline: #332B23;
+    --accent-primary: #D97706;
+    --accent-primary-hover: #F59E0B;
+    --accent-on-primary: #FFFFFF;
+    --accent-container: #3E2B12;
+    --accent-on-container: #FDE68A;
+    --accent-text: #FBBF24;
+    --accent-ring: #F59E0B;
+  }
+
+  /* Theme: Nacht-Indigo (Indigo) */
+  :root[data-theme="indigo"] {
+    --m3-canvas: #F3F4FA;
+    --m3-surface: #FFFFFF;
+    --m3-surface-container: #E9EBF6;
+    --m3-outline: #D6DAEC;
+    --accent-primary: #4F46E5;
+    --accent-primary-hover: #4338CA;
+    --accent-on-primary: #FFFFFF;
+    --accent-container: #E0E7FF;
+    --accent-on-container: #3730A3;
+    --accent-text: #4F46E5;
+    --accent-ring: #6366F1;
+  }
+  .dark[data-theme="indigo"] {
+    --m3-canvas: #0E1019;
+    --m3-surface: #151826;
+    --m3-surface-container: #1C2033;
+    --m3-outline: #272D45;
+    --accent-primary: #4F46E5;
+    --accent-primary-hover: #6366F1;
+    --accent-on-primary: #FFFFFF;
+    --accent-container: #23265A;
+    --accent-on-container: #C7D2FE;
+    --accent-text: #818CF8;
+    --accent-ring: #818CF8;
+  }
+
+  /* Theme: Rubin (Rose) */
+  :root[data-theme="rose"] {
+    --m3-canvas: #F9F4F6;
+    --m3-surface: #FFFFFF;
+    --m3-surface-container: #F3E9ED;
+    --m3-outline: #E5D4DB;
+    --accent-primary: #E11D48;
+    --accent-primary-hover: #BE123C;
+    --accent-on-primary: #FFFFFF;
+    --accent-container: #FFE4E6;
+    --accent-on-container: #9F1239;
+    --accent-text: #BE123C;
+    --accent-ring: #E11D48;
+  }
+  .dark[data-theme="rose"] {
+    --m3-canvas: #140F12;
+    --m3-surface: #1C1519;
+    --m3-surface-container: #261C22;
+    --m3-outline: #362730;
+    --accent-primary: #E11D48;
+    --accent-primary-hover: #F43F5E;
+    --accent-on-primary: #FFFFFF;
+    --accent-container: #471828;
+    --accent-on-container: #FECDD3;
+    --accent-text: #FB7185;
+    --accent-ring: #FB7185;
+  }
+
+  /* Theme: Graphit Mono (Graphite) */
+  :root[data-theme="graphite"] {
+    --m3-canvas: #F5F6F8;
+    --m3-surface: #FFFFFF;
+    --m3-surface-container: #EBEEF2;
+    --m3-outline: #D8DEE6;
+    --accent-primary: #1E293B;
+    --accent-primary-hover: #0F172A;
+    --accent-on-primary: #FFFFFF;
+    --accent-container: #E2E8F0;
+    --accent-on-container: #0F172A;
+    --accent-text: #334155;
+    --accent-ring: #475569;
+  }
+  .dark[data-theme="graphite"] {
+    --m3-canvas: #0D0F12;
+    --m3-surface: #15181C;
+    --m3-surface-container: #1D2228;
+    --m3-outline: #2B313B;
+    --accent-primary: #E2E8F0;
+    --accent-primary-hover: #FFFFFF;
+    --accent-on-primary: #0F172A;
+    --accent-container: #262E3A;
+    --accent-on-container: #F1F5F9;
+    --accent-text: #CBD5E1;
+    --accent-ring: #94A3B8;
+  }
+
+  html {
+    font-family: var(--font-body);
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    background-color: var(--m3-canvas);
+  }
+
+  h1, h2, h3, .font-display {
+    font-family: var(--font-display);
+  }
+
+  code, pre, .font-mono {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer components {
+  /* Semantic Theme Utility Classes */
+  .theme-canvas {
+    background-color: var(--m3-canvas);
+  }
+
+  .theme-surface {
+    background-color: var(--m3-surface);
+    border-color: var(--m3-outline);
+  }
+
+  .theme-surface-alt {
+    background-color: var(--m3-surface-container);
+  }
+
+  .theme-border {
+    border-color: var(--m3-outline);
+  }
+
+  .theme-btn-primary {
+    background-color: var(--accent-primary);
+    color: var(--accent-on-primary);
+  }
+  .theme-btn-primary:hover {
+    background-color: var(--accent-primary-hover);
+  }
+
+  .theme-tonal {
+    background-color: var(--accent-container);
+    color: var(--accent-on-container);
+  }
+
+  .theme-text {
+    color: var(--accent-text);
+  }
+
+  .theme-dot {
+    background-color: var(--accent-ring);
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Custom Range Slider (Material 3 Tactile Track) */
+input[type="range"].m3-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+input[type="range"].m3-slider::-webkit-slider-runnable-track {
+  height: 10px;
+  border-radius: 9999px;
+}
+
+input[type="range"].m3-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 24px;
+  height: 24px;
+  border-radius: 9999px;
+  background: #ffffff;
+  border: 2.5px solid var(--accent-ring);
+  margin-top: -7px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
+  transition: transform 150ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.dark input[type="range"].m3-slider::-webkit-slider-thumb {
+  background: #E6EDF3;
+  border-color: var(--accent-ring);
+}
+
+input[type="range"].m3-slider:active::-webkit-slider-thumb {
+  transform: scale(1.15);
+}
+
+input[type="range"].m3-slider::-moz-range-track {
+  height: 10px;
+  border-radius: 9999px;
+}
+
+input[type="range"].m3-slider::-moz-range-thumb {
+  width: 24px;
+  height: 24px;
+  border-radius: 9999px;
+  background: #ffffff;
+  border: 2.5px solid var(--accent-ring);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
+}
+
+/* Safe area bottom padding for Android/iOS PWA */
+.pb-safe {
+  padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+}
+
+/* Subtle custom scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.3);
+  border-radius: 9999px;
+}
+.dark ::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.22);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

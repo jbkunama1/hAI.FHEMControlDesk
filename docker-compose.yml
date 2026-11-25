@@ -1,0 +1,15 @@
+services:
+  fhem-control-desk:
+    build: .
+    container_name: fhem-control-desk
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      # HIER die IP-Adresse oder den Hostnamen deines FHEM-Servers im Heimnetz eintragen
+      # (mehrere Adressen kommagetrennt, z. B. "192.168.178.50,fhem.fritz.box"):
+      FHEM_ALLOWED_HOSTS: "192.168.178.50"
+      # Optional fuer lokalen KI-Server (z. B. Ollama im LAN):
+      # AI_ALLOWED_HOSTS: "192.168.178.60"
