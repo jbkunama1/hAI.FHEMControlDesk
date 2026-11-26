@@ -22,6 +22,26 @@ function readCliArg(name: string): string | undefined {
 const PORT = Number(readCliArg('--port') || process.env.PORT) || 3000;
 const HOST = readCliArg('--host') || process.env.HOST || '0.0.0.0';
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024; // 8 MB for large jsonlist2 payloads (200+ devices)
+const STARTED_AT = Date.now();
+
+// ---------------------------------------------------------------------------
+// Structured logging (JSON lines, secrets are never logged)
+// ---------------------------------------------------------------------------
+const LOG_LEVELS = {debug: 10, info: 20, warn: 30, error: 40} as const;
+type LogLevel = keyof typeof LOG_LEVELS;
+const ACTIVE_LOG_LEVEL = LOG_LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase() as LogLevel] ?? LOG_LEVELS.info;
+const SENSITIVE_KEY = /pass|token|key|secret|authorization|cookie|cmd|header/i;
+
+function log(level: LogLevel, msg: string, fields: Record<string, unknown> = {}): void {
+  if (LOG_LEVELS[level] < ACTIVE_LOG_LEVEL) return;
+  const safe: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(fields)) {
+    safe[k] = SENSITIVE_KEY.test(k) ? '[redacted]' : v;
+  }
+  const line = JSON.stringify({ts: new Date().toISOString(), level, msg, ...safe});
+  if (level === 'error') console.error(line);
+  else console.log(line);
+}
 
 interface FhemExecuteBody {
   protocol?: string;
@@ -71,57 +91,68 @@ function getAllowedHosts(extraEnvKey?: string): Set<string> {
   );
 }
 
-function isIpv4InRange(ip: string, prefixA: number, prefixBStart?: number, prefixBEnd?: number): boolean {
-  const parts = ip.split('.').map(Number);
-  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) {
-    return false;
+type IpClass = 'always_blocked' | 'private_lan' | 'public';
+
+function classifyIpv4(ip: string): IpClass {
+  const p = ip.split('.').map(Number);
+  if (p.length !== 4 || p.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
+    return 'always_blocked';
   }
-  if (parts[0] !== prefixA) return false;
-  if (prefixBStart !== undefined && prefixBEnd !== undefined) {
-    return parts[1] >= prefixBStart && parts[1] <= prefixBEnd;
+  const [a, b] = p;
+  // Loopback, unspecified/"this network", link-local (cloud metadata), multicast/reserved
+  if (a === 127 || a === 0 || (a === 169 && b === 254) || a >= 224) {
+    return 'always_blocked';
   }
-  return true;
+  // RFC1918 private LAN and CGNAT (100.64.0.0/10, e.g. Tailscale) need an explicit allow-list entry
+  if (a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127)) {
+    return 'private_lan';
+  }
+  return 'public';
 }
 
-function classifyIpAddress(ip: string): 'always_blocked' | 'private_lan' | 'public' {
-  const normalized = ip.toLowerCase().trim();
-  const mappedV4 = normalized.startsWith('::ffff:') ? normalized.slice(7) : normalized;
+function expandIpv6(ip: string): number[] | null {
+  let addr = ip.split('%')[0];
+  const dotted = addr.match(/(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (dotted) {
+    const q = dotted[1].split('.').map(Number);
+    if (q.some((n) => n > 255)) return null;
+    addr = `${addr.slice(0, -dotted[1].length)}${((q[0] << 8) | q[1]).toString(16)}:${((q[2] << 8) | q[3]).toString(16)}`;
+  }
+  const halves = addr.split('::');
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const missing = 8 - head.length - tail.length;
+  if (halves.length === 1 ? missing !== 0 : missing < 1) return null;
+  const groups = [...head, ...Array(halves.length === 2 ? missing : 0).fill('0'), ...tail].map((g) => parseInt(g, 16));
+  return groups.length === 8 && groups.every((n) => Number.isInteger(n) && n >= 0 && n <= 0xffff) ? groups : null;
+}
 
-  if (net.isIPv4(mappedV4)) {
-    // Always block loopback, link-local / cloud metadata, unspecified, CGNAT
-    if (
-      isIpv4InRange(mappedV4, 127) ||
-      isIpv4InRange(mappedV4, 0) ||
-      isIpv4InRange(mappedV4, 169, 254, 254)
-    ) {
-      return 'always_blocked';
-    }
-    // RFC1918 private LAN & CGNAT addresses
-    if (
-      isIpv4InRange(mappedV4, 10) ||
-      isIpv4InRange(mappedV4, 172, 16, 31) ||
-      isIpv4InRange(mappedV4, 192, 168, 168) ||
-      isIpv4InRange(mappedV4, 100, 64, 127)
-    ) {
-      return 'private_lan';
-    }
-    return 'public';
+function classifyIpAddress(ip: string): IpClass {
+  const normalized = ip.toLowerCase().trim().split('%')[0];
+
+  if (net.isIPv4(normalized)) {
+    return classifyIpv4(normalized);
   }
 
   if (net.isIPv6(normalized)) {
-    if (
-      normalized === '::1' ||
-      normalized === '::' ||
-      normalized.startsWith('fe80:') ||
-      normalized.startsWith('fe9') ||
-      normalized.startsWith('fea') ||
-      normalized.startsWith('feb')
-    ) {
+    const g = expandIpv6(normalized);
+    if (!g) return 'always_blocked';
+    const embeddedV4 = `${g[6] >> 8}.${g[6] & 255}.${g[7] >> 8}.${g[7] & 255}`;
+    const upperZero = g.slice(0, 5).every((n) => n === 0);
+
+    // ::/96 (unspecified, loopback, deprecated IPv4-compatible) -> never allowed
+    if (upperZero && g[5] === 0) return 'always_blocked';
+    // ::ffff:0:0/96 IPv4-mapped (dotted or hex notation)
+    if (upperZero && g[5] === 0xffff) return classifyIpv4(embeddedV4);
+    // 64:ff9b::/96 NAT64
+    if (g[0] === 0x64 && g[1] === 0xff9b && g.slice(2, 6).every((n) => n === 0)) return classifyIpv4(embeddedV4);
+    // fe80::/10 link-local, fec0::/10 site-local, ff00::/8 multicast
+    if ((g[0] & 0xffc0) === 0xfe80 || (g[0] & 0xffc0) === 0xfec0 || (g[0] & 0xff00) === 0xff00) {
       return 'always_blocked';
     }
-    if (normalized.startsWith('fc') || normalized.startsWith('fd')) {
-      return 'private_lan';
-    }
+    // fc00::/7 unique local
+    if ((g[0] & 0xfe00) === 0xfc00) return 'private_lan';
     return 'public';
   }
 
@@ -131,7 +162,7 @@ function classifyIpAddress(ip: string): 'always_blocked' | 'private_lan' | 'publ
 async function validateTargetHost(
   host: string,
   extraEnvKey?: string
-): Promise<{ok: true; resolvedIp?: string} | {ok: false; code: string; message: string}> {
+): Promise<{ok: true; resolvedIp: string} | {ok: false; code: string; message: string}> {
   const cleanHost = host.trim().toLowerCase();
   if (!cleanHost || cleanHost.length > 253 || /[\s/@?#\\]/.test(cleanHost)) {
     return {
@@ -216,6 +247,18 @@ async function validateTargetHost(
   }
 }
 
+// Forces the socket to connect to the IP that passed validation (prevents DNS rebinding / TOCTOU).
+function pinnedLookup(ip: string): net.LookupFunction {
+  const family = net.isIPv6(ip) ? 6 : 4;
+  return (_hostname, options, callback) => {
+    if (options.all) {
+      callback(null, [{address: ip, family}]);
+    } else {
+      callback(null, ip, family);
+    }
+  };
+}
+
 function executeFhemHttpRequest(options: {
   protocol: 'http' | 'https';
   host: string;
@@ -223,9 +266,11 @@ function executeFhemHttpRequest(options: {
   method: 'GET' | 'POST';
   pathWithQuery: string;
   bodyPayload?: string;
+  contentType?: string;
   headers: Record<string, string>;
   acceptSelfSigned: boolean;
   timeoutMs: number;
+  pinnedIp: string;
 }): Promise<{
   statusCode: number;
   body: string;
@@ -242,7 +287,7 @@ function executeFhemHttpRequest(options: {
     let payloadBuf: Buffer | undefined;
     if (options.method === 'POST' && options.bodyPayload !== undefined) {
       payloadBuf = Buffer.from(options.bodyPayload, 'utf8');
-      reqHeaders['Content-Type'] = 'application/x-www-form-urlencoded';
+      reqHeaders['Content-Type'] = options.contentType || 'application/x-www-form-urlencoded';
       reqHeaders['Content-Length'] = String(payloadBuf.byteLength);
     }
 
@@ -254,6 +299,7 @@ function executeFhemHttpRequest(options: {
       method: options.method,
       headers: reqHeaders,
       timeout: options.timeoutMs,
+      lookup: pinnedLookup(options.pinnedIp),
       ...(isHttps
         ? {
             rejectUnauthorized: !options.acceptSelfSigned,
@@ -310,6 +356,24 @@ function executeFhemHttpRequest(options: {
   });
 }
 
+function tcpPing(host: string, port: number, timeoutMs: number): Promise<{ok: boolean; latencyMs: number}> {
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    const socket = net.connect({host, port});
+    let done = false;
+    const finish = (ok: boolean) => {
+      if (done) return;
+      done = true;
+      socket.destroy();
+      resolve({ok, latencyMs: Date.now() - startedAt});
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => finish(true));
+    socket.once('timeout', () => finish(false));
+    socket.once('error', () => finish(false));
+  });
+}
+
 const MAX_LONGPOLL_LINE_BYTES = 256 * 1024; // 256 KB safety cap per buffered line
 const MAX_LONGPOLL_DURATION_MS = 10 * 60 * 1000; // 10 min max lifetime before clean reconnect
 const LONGPOLL_HEARTBEAT_MS = 20_000;
@@ -317,6 +381,7 @@ const LONGPOLL_HEARTBEAT_MS = 20_000;
 interface ValidatedFhemConnection {
   protocol: 'http' | 'https';
   host: string;
+  resolvedIp: string;
   port: number;
   basePath: string;
   httpMethod: 'GET' | 'POST';
@@ -446,6 +511,7 @@ async function parseAndValidateFhemConnection(
     conn: {
       protocol,
       host,
+      resolvedIp: hostCheck.resolvedIp,
       port,
       basePath,
       httpMethod,
@@ -475,8 +541,58 @@ async function createApp() {
   app.disable('x-powered-by');
   app.use(express.json({limit: '1mb'}));
 
-  app.get('/api/health', (_req, res) => {
-    res.json({status: 'ok', timestamp: new Date().toISOString()});
+  // Request logging for /api/* (method, path, status, duration, errorCode only - never bodies/queries)
+  app.use((req, res, next) => {
+    if (!req.path.startsWith('/api/') || req.path === '/api/health') {
+      next();
+      return;
+    }
+    const startedAt = Date.now();
+    const origJson = res.json.bind(res);
+    res.json = ((payload: unknown) => {
+      const p = payload as {ok?: boolean; errorCode?: string} | null;
+      if (p && typeof p === 'object' && p.ok === false && p.errorCode) {
+        res.locals.errorCode = p.errorCode;
+      }
+      return origJson(payload);
+    }) as typeof res.json;
+    res.on('finish', () => {
+      const errorCode = res.locals.errorCode as string | undefined;
+      log(errorCode ? 'warn' : 'info', 'http_request', {
+        method: req.method,
+        path: req.path,
+        status: res.statusCode,
+        ms: Date.now() - startedAt,
+        errorCode,
+      });
+    });
+    next();
+  });
+
+  // Liveness by default (used by Docker HEALTHCHECK). ?deep=1 additionally pings FHEM via TCP
+  // when FHEM_HEALTH_HOST (and optionally FHEM_HEALTH_PORT, default 8083) is configured.
+  app.get('/api/health', async (req, res) => {
+    const payload: Record<string, unknown> = {
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+      uptimeSec: Math.round((Date.now() - STARTED_AT) / 1000),
+    };
+    const deep = String(req.query.deep || '').toLowerCase();
+    if (deep === '1' || deep === 'true') {
+      const fhemHost = (process.env.FHEM_HEALTH_HOST || '').trim();
+      if (!fhemHost) {
+        payload.fhem = {configured: false};
+      } else {
+        const fhemPort = Number(process.env.FHEM_HEALTH_PORT) || 8083;
+        const result = await tcpPing(fhemHost, fhemPort, 2000);
+        payload.fhem = {configured: true, ok: result.ok, latencyMs: result.latencyMs};
+        if (!result.ok) {
+          payload.status = 'degraded';
+          log('warn', 'health_fhem_unreachable', {port: fhemPort});
+        }
+      }
+    }
+    res.json(payload);
   });
 
   app.post('/api/fhem/execute', async (req, res) => {
@@ -513,6 +629,7 @@ async function createApp() {
     const {
       protocol,
       host,
+      resolvedIp,
       port,
       basePath,
       httpMethod,
@@ -548,6 +665,7 @@ async function createApp() {
         headers,
         acceptSelfSigned,
         timeoutMs,
+        pinnedIp: resolvedIp,
       });
     };
 
@@ -555,11 +673,7 @@ async function createApp() {
       let result = await sendWithToken(manualCsrfToken);
 
       const rawAutoToken = (result.csrfTokenHeader || '').trim();
-      const isValidAutoToken =
-        rawAutoToken.length > 0 &&
-        rawAutoToken.length <= 128 &&
-        rawAutoToken.toLowerCase() !== 'none' &&
-        !/[\r\n\s]/.test(rawAutoToken);
+      const isValidAutoToken = isValidFhemCsrfToken(rawAutoToken);
 
       // In 'auto' CSRF mode, transparently retry once if FHEMWEB returns X-FHEM-csrfToken on 400/403
       if (csrfMode === 'auto' && (result.statusCode === 400 || result.statusCode === 403)) {
@@ -575,14 +689,10 @@ async function createApp() {
             headers,
             acceptSelfSigned,
             timeoutMs: Math.min(timeoutMs, 5000),
+            pinnedIp: resolvedIp,
           });
           const probeTok = (probe.csrfTokenHeader || '').trim();
-          if (
-            probeTok.length > 0 &&
-            probeTok.length <= 128 &&
-            probeTok.toLowerCase() !== 'none' &&
-            !/[\r\n\s]/.test(probeTok)
-          ) {
+          if (isValidFhemCsrfToken(probeTok)) {
             retryToken = probeTok;
           }
         }
@@ -720,6 +830,7 @@ async function createApp() {
         return;
       }
 
+      log('error', 'fhem_execute_network_error', {code});
       res.status(200).json({
         ok: false,
         errorCode: 'NETWORK_ERROR',
@@ -753,6 +864,7 @@ async function createApp() {
     const {
       protocol,
       host,
+      resolvedIp,
       port,
       basePath,
       csrfMode,
@@ -776,6 +888,7 @@ async function createApp() {
           headers,
           acceptSelfSigned,
           timeoutMs: Math.min(timeoutMs, 5000),
+          pinnedIp: resolvedIp,
         });
         if (probe.csrfTokenHeader && isValidFhemCsrfToken(probe.csrfTokenHeader)) {
           effectiveCsrf = probe.csrfTokenHeader.trim();
@@ -855,6 +968,7 @@ async function createApp() {
           Accept: 'text/plain, application/json, */*',
           Connection: 'keep-alive',
         },
+        lookup: pinnedLookup(resolvedIp),
         ...(isHttps ? {rejectUnauthorized: !acceptSelfSigned} : {}),
       };
 
@@ -1059,12 +1173,10 @@ async function createApp() {
       timeoutMs?: number;
     };
 
-    const rawBaseUrl =
-      (typeof body.baseUrl === 'string' && body.baseUrl.trim()) ||
-      (process.env.AI_BASE_URL || '').trim();
-    const apiKey =
-      (typeof body.apiKey === 'string' && body.apiKey.trim()) ||
-      (process.env.AI_API_KEY || '').trim();
+    const envBaseUrl = (process.env.AI_BASE_URL || '').trim();
+    const bodyBaseUrl = typeof body.baseUrl === 'string' ? body.baseUrl.trim() : '';
+    const rawBaseUrl = bodyBaseUrl || envBaseUrl;
+    const bodyApiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
     const model =
       (typeof body.model === 'string' && body.model.trim()) ||
       (process.env.AI_MODEL || '').trim();
@@ -1108,7 +1220,19 @@ async function createApp() {
       return;
     }
 
-    const hostCheck = await validateTargetHost(parsedUrl.hostname, 'AI_ALLOWED_HOSTS');
+    // The server-side AI_API_KEY is only ever sent to the origin configured in AI_BASE_URL.
+    let envKeyAllowed = false;
+    if (envBaseUrl) {
+      try {
+        envKeyAllowed = new URL(envBaseUrl).origin === parsedUrl.origin;
+      } catch {
+        envKeyAllowed = false;
+      }
+    }
+    const apiKey = bodyApiKey || (envKeyAllowed ? (process.env.AI_API_KEY || '').trim() : '');
+
+    const targetHostname = parsedUrl.hostname.replace(/^\[|\]$/g, '');
+    const hostCheck = await validateTargetHost(targetHostname, 'AI_ALLOWED_HOSTS');
     if (!hostCheck.ok) {
       res.status(400).json({
         ok: false,
@@ -1153,10 +1277,12 @@ async function createApp() {
     }
 
     // Build /chat/completions endpoint cleanly without duplicating the suffix
-    const normalizedBase = parsedUrl.toString().replace(/\/+$/, '');
-    const endpoint = normalizedBase.endsWith('/chat/completions')
-      ? normalizedBase
-      : `${normalizedBase}/chat/completions`;
+    let endpointPath = parsedUrl.pathname.replace(/\/+$/, '');
+    if (!endpointPath.endsWith('/chat/completions')) {
+      endpointPath = `${endpointPath}/chat/completions`;
+    }
+    const isHttpsTarget = parsedUrl.protocol === 'https:';
+    const targetPort = parsedUrl.port ? Number(parsedUrl.port) : isHttpsTarget ? 443 : 80;
 
     const timeoutMs = Math.min(60000, Math.max(5000, Number(body.timeoutMs) || 45000));
     const temperature =
@@ -1164,32 +1290,36 @@ async function createApp() {
         ? Math.max(0, Math.min(1.5, body.temperature))
         : 0.2;
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    const startedAt = Date.now();
-
     try {
       const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
         Accept: 'application/json',
+        'User-Agent': 'FHEM-Control-Desk/1.0',
       };
-      if (apiKey) {
+      if (apiKey && !/[\r\n]/.test(apiKey)) {
         headers.Authorization = `Bearer ${apiKey}`;
       }
 
-      const upstream = await fetch(endpoint, {
+      // Pinned to the validated IP; redirects are intentionally not followed.
+      const upstream = await executeFhemHttpRequest({
+        protocol: isHttpsTarget ? 'https' : 'http',
+        host: targetHostname,
+        port: targetPort,
         method: 'POST',
-        headers,
-        body: JSON.stringify({
+        pathWithQuery: `${endpointPath}${parsedUrl.search}`,
+        bodyPayload: JSON.stringify({
           model,
           messages: sanitizedMessages,
           temperature,
         }),
-        signal: controller.signal,
+        contentType: 'application/json',
+        headers,
+        acceptSelfSigned: false,
+        timeoutMs,
+        pinnedIp: hostCheck.resolvedIp,
       });
 
-      const latencyMs = Date.now() - startedAt;
-      const rawText = await upstream.text();
+      const latencyMs = upstream.latencyMs;
+      const upstreamOk = upstream.statusCode >= 200 && upstream.statusCode < 300;
 
       let parsed: {
         choices?: Array<{message?: {content?: string | Array<{type?: string; text?: string}>}}>;
@@ -1198,28 +1328,28 @@ async function createApp() {
         error?: {message?: string; type?: string; code?: string};
       } | null = null;
       try {
-        parsed = JSON.parse(rawText);
+        parsed = JSON.parse(upstream.body);
       } catch {
         parsed = null;
       }
 
-      if (!upstream.ok) {
+      if (!upstreamOk) {
         const providerMsg = parsed?.error?.message;
-        let friendly = `KI-Endpunkt antwortete mit HTTP ${upstream.status}.`;
-        if (upstream.status === 401) {
+        let friendly = `KI-Endpunkt antwortete mit HTTP ${upstream.statusCode}.`;
+        if (upstream.statusCode === 401) {
           friendly = 'API-Key ungültig oder nicht autorisiert (HTTP 401). Bitte Key prüfen.';
-        } else if (upstream.status === 403) {
+        } else if (upstream.statusCode === 403) {
           friendly = 'Zugriff vom KI-Anbieter verweigert (HTTP 403).';
-        } else if (upstream.status === 404) {
+        } else if (upstream.statusCode === 404) {
           friendly = `Endpunkt oder Modell „${model}“ nicht gefunden (HTTP 404). Basis-URL (meist mit /v1) prüfen.`;
-        } else if (upstream.status === 429) {
+        } else if (upstream.statusCode === 429) {
           friendly = 'Rate-Limit oder Kontingent beim KI-Anbieter überschritten (HTTP 429).';
         }
         res.status(200).json({
           ok: false,
-          statusCode: upstream.status,
+          statusCode: upstream.statusCode,
           latencyMs,
-          errorCode: `HTTP_${upstream.status}`,
+          errorCode: `HTTP_${upstream.statusCode}`,
           message: providerMsg ? `${friendly} (${providerMsg.slice(0, 180)})` : friendly,
         });
         return;
@@ -1236,7 +1366,7 @@ async function createApp() {
       if (!content.trim()) {
         res.status(200).json({
           ok: false,
-          statusCode: upstream.status,
+          statusCode: upstream.statusCode,
           latencyMs,
           errorCode: 'EMPTY_RESPONSE',
           message: 'Der KI-Endpunkt hat eine leere Antwort zurückgegeben.',
@@ -1252,8 +1382,8 @@ async function createApp() {
         latencyMs,
       });
     } catch (err: unknown) {
-      const error = err as {name?: string; message?: string};
-      if (error?.name === 'AbortError') {
+      const error = err as NodeJS.ErrnoException & {message?: string};
+      if (error.code === 'ETIMEDOUT' || error.message === 'REQUEST_TIMEOUT') {
         res.status(200).json({
           ok: false,
           errorCode: 'TIMEOUT',
@@ -1261,13 +1391,12 @@ async function createApp() {
         });
         return;
       }
+      log('error', 'ai_chat_network_error', {code: error.code || ''});
       res.status(200).json({
         ok: false,
         errorCode: 'NETWORK_ERROR',
         message: 'Verbindung zum OpenAI-kompatiblen Endpunkt fehlgeschlagen. URL und Netzwerk prüfen.',
       });
-    } finally {
-      clearTimeout(timer);
     }
   });
 
@@ -1293,7 +1422,7 @@ async function createApp() {
       });
 
     viteReady.catch((err) => {
-      console.error('Failed to initialize Vite dev middleware:', err);
+      log('error', 'vite_init_failed', {error: String(err)});
       process.exit(1);
     });
 
@@ -1350,18 +1479,19 @@ async function createApp() {
   }
 
   httpServer.on('error', (err) => {
-    console.error('HTTP server failed to start:', err);
+    log('error', 'http_server_failed', {error: String(err)});
     process.exit(1);
   });
 
   httpServer.listen(PORT, HOST, () => {
-    console.log(`FHEM Control Desk server running on http://${HOST}:${PORT}`);
+    log('info', 'server_started', {host: HOST, port: PORT, env: process.env.NODE_ENV || 'development'});
   });
 
   let shuttingDown = false;
   const shutdown = () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    log('info', 'server_shutdown');
     const forceExit = setTimeout(() => process.exit(0), 2000);
     forceExit.unref();
     Promise.resolve(viteInstance?.close())
@@ -1376,6 +1506,6 @@ async function createApp() {
 }
 
 createApp().catch((err) => {
-  console.error('Fatal error starting FHEM Control Desk server:', err);
+  log('error', 'fatal_startup_error', {error: String(err)});
   process.exit(1);
 });
