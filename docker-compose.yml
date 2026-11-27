@@ -1,15 +1,76 @@
+# ==============================================================================
+# FHEM Control Desk – Integration in einen BESTEHENDEN FHEM-Server / Docker-Stack
+# ==============================================================================
+# Verbindet sich entweder mit:
+#   A) einem laufenden FHEM im Heimnetz:    FHEM_UPSTREAM_URL="http://192.168.178.50:8083/fhem"
+#   B) einem FHEM-Dienst auf demselben Host: FHEM_UPSTREAM_URL="http://host.docker.internal:8083/fhem"
+#   C) einem bestehenden FHEM-Docker-Container im gemeinsamen Netzwerk (siehe networks unten)
+# ==============================================================================
+
 services:
   fhem-control-desk:
     build: .
     container_name: fhem-control-desk
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "${APP_PORT_BIND:-3000}:3000"
+    extra_hosts:
+      # Ermöglicht Zugriff auf natives FHEM auf demselben Linux-Host via "host.docker.internal"
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Persistenter Speicher für Benutzerkonten und geräteübergreifend synchronisierte Profile
+      - fhem_desk_data:/app/data
     environment:
       NODE_ENV: production
       PORT: 3000
-      # HIER die IP-Adresse oder den Hostnamen deines FHEM-Servers im Heimnetz eintragen
-      # (mehrere Adressen kommagetrennt, z. B. "192.168.178.50,fhem.fritz.box"):
-      FHEM_ALLOWED_HOSTS: "192.168.178.50"
-      # Optional fuer lokalen KI-Server (z. B. Ollama im LAN):
-      # AI_ALLOWED_HOSTS: "192.168.178.60"
+      DATA_DIR: /app/data
+      TZ: "${TZ:-Europe/Berlin}"
+
+      # ------------------------------------------------------------------------
+      # EMPFOHLEN FÜR EXKLUSIVE WEBUI (Server-Managed Stack-Modus)
+      # ------------------------------------------------------------------------
+      # Wenn FHEM_UPSTREAM_URL gesetzt ist, verbindet sich die WebUI sofort und
+      # automatisch mit deinem FHEM-Server – ohne Test-Instanz und ohne dass
+      # FHEM-Passwörter im Browser eingegeben werden müssen:
+      FHEM_UPSTREAM_URL: "${FHEM_UPSTREAM_URL:-}"
+      FHEM_EXCLUSIVE_MODE: "${FHEM_EXCLUSIVE_MODE:-true}"
+      FHEM_UPSTREAM_CSRF_MODE: "${FHEM_UPSTREAM_CSRF_MODE:-auto}"
+      FHEM_UPSTREAM_METHOD: "${FHEM_UPSTREAM_METHOD:-GET}"
+      FHEM_UPSTREAM_AUTH_TYPE: "${FHEM_UPSTREAM_AUTH_TYPE:-}"
+      FHEM_UPSTREAM_USER: "${FHEM_UPSTREAM_USER:-}"
+      FHEM_UPSTREAM_PASS: "${FHEM_UPSTREAM_PASS:-}"
+      FHEM_UPSTREAM_API_KEY: "${FHEM_UPSTREAM_API_KEY:-}"
+      FHEM_UPSTREAM_HEADER_NAME: "${FHEM_UPSTREAM_HEADER_NAME:-}"
+      FHEM_UPSTREAM_HEADER_VALUE: "${FHEM_UPSTREAM_HEADER_VALUE:-}"
+      FHEM_UPSTREAM_QUERY_PARAM: "${FHEM_UPSTREAM_QUERY_PARAM:-}"
+      FHEM_UPSTREAM_QUERY_VALUE: "${FHEM_UPSTREAM_QUERY_VALUE:-}"
+      FHEM_UPSTREAM_ACCEPT_SELF_SIGNED: "${FHEM_UPSTREAM_ACCEPT_SELF_SIGNED:-false}"
+
+      # Fallback-Allowlist (nur benötigt, wenn FHEM_UPSTREAM_URL leer ist oder FHEM_EXCLUSIVE_MODE=false):
+      FHEM_ALLOWED_HOSTS: "${FHEM_ALLOWED_HOSTS:-192.168.178.50}"
+
+      # ------------------------------------------------------------------------
+      # SICHERHEIT & BENUTZERKONTEN
+      # ------------------------------------------------------------------------
+      REQUIRE_LOGIN: "${REQUIRE_LOGIN:-true}"
+      ADMIN_BOOTSTRAP_TOKEN: "${ADMIN_BOOTSTRAP_TOKEN:-}"
+      APP_AUTH_USER: "${APP_AUTH_USER:-}"
+      APP_AUTH_PASS: "${APP_AUTH_PASS:-}"
+
+      # Optional: KI-Assistent (OpenAI-kompatibel oder lokales Ollama)
+      AI_BASE_URL: "${AI_BASE_URL:-}"
+      AI_API_KEY: "${AI_API_KEY:-}"
+      AI_MODEL: "${AI_MODEL:-}"
+      AI_ALLOWED_HOSTS: "${AI_ALLOWED_HOSTS:-}"
+
+    # Optional: Mit einem bereits existierenden FHEM-Docker-Netzwerk verbinden:
+    # networks:
+    #   - existing_fhem_net
+
+volumes:
+  fhem_desk_data:
+
+# networks:
+#   existing_fhem_net:
+#     external: true
+#     name: fhem_default

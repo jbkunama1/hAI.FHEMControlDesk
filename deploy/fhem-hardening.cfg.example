@@ -1,0 +1,50 @@
+# ==============================================================================
+# FHEM-Konfigurationsvorlage: FHEM Control Desk als exklusive WebUI absichern
+# ==============================================================================
+# Diese Befehle können direkt in FHEM (oder in deiner fhem.cfg) ergänzt werden,
+# wenn FHEM Control Desk künftig deine alleinige Weboberfläche sein soll.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. DEDIZIERTE INTERNE API-INSTANZ FÜR FHEM CONTROL DESK (EMPFOHLEN)
+# ------------------------------------------------------------------------------
+# Option A – Natives FHEM auf demselben Host (nur über 127.0.0.1 erreichbar!):
+#   define WEB_DESK FHEMWEB 8089 global
+#   attr WEB_DESK allowedCommands jsonlist2,set,get,attr,deleteattr,define,delete,save,shutdown,list
+#   attr WEB_DESK csrfToken random
+#   attr WEB_DESK longpoll 1
+#   # Bindet WEB_DESK ausschließlich an Localhost (nicht im LAN erreichbar!):
+#   attr WEB_DESK allowfrom 127\.0\.0\.1|::1
+#
+#   define allowed_WEB_DESK allowed
+#   attr allowed_WEB_DESK validFor WEB_DESK
+#   attr allowed_WEB_DESK basicAuth <BASE64_AUS_BENUTZER:PASSWORT>
+#
+#   (Base64 erstellen im Terminal: printf 'fhemdesk:StarkesPasswort' | base64)
+#   In der .env von FHEM Control Desk eintragen:
+#     FHEM_UPSTREAM_URL="http://127.0.0.1:8089/fhem"
+#     FHEM_UPSTREAM_USER="fhemdesk"
+#     FHEM_UPSTREAM_PASS="StarkesPasswort"
+#     FHEM_EXCLUSIVE_MODE="true"
+#
+# Option B – Docker-Stack (docker-compose.stack.yml):
+#   Im internen Docker-Netzwerk "fhem_internal" ist Port 8083 bereits komplett
+#   vom LAN/Internet isoliert (kein ports-Mapping am FHEM-Container).
+#   Zusätzlich kannst du trotzdem allowed_WEB + basicAuth + csrfToken random setzen!
+
+# ------------------------------------------------------------------------------
+# 2. ALTE FHEMWEB-OBERFLÄCHE (PORT 8083) ABSCHOTTEN (OPTIONAL)
+# ------------------------------------------------------------------------------
+# Wenn niemand im LAN mehr das alte FHEMWEB aufrufen soll, beschränke das
+# bestehende WEB-Device ebenfalls auf Localhost (nur noch für Notfälle via SSH-Tunnel):
+#   attr WEB allowfrom 127\.0\.0\.1|::1
+
+# ------------------------------------------------------------------------------
+# 3. SYSTEM-METRIKEN FÜR DIE DASHBOARD-KARTE "FHEM-SERVER ZUSTAND"
+# ------------------------------------------------------------------------------
+# Damit CPU-Last, CPU-Temperatur, Speicherverbrauch und Uptime auf dem Dashboard
+# automatisch per FHEM ReadingsVal angezeigt werden:
+#   define FHEM_System SYSMON 1 1 1 10
+#   attr FHEM_System room Technik
+#   attr FHEM_System alias FHEM Server
+#   save

@@ -13,8 +13,10 @@ import type {
   LongpollState,
   ScheduleEntry,
 } from '../types/fhem';
-import {createInitialEvents, createInitialFhemDevices, createInitialLogs} from './fhemSeedData';
+import {createInitialEvents, createInitialFhemDevices, createInitialLogs, createSeedLogDevices} from './fhemSeedData';
+import {getActiveSessionToken} from './profileClient';
 import {loadSandboxSnapshot, saveSandboxSnapshot} from './secureStorage';
+import {generateAuthenticFhemLogOutput, parseFhemLogTimestamp, parseNumericReadingValue} from './sensorHistory';
 
 export function buildFhemEndpointUrl(
   config: FhemConnectionConfig,
@@ -150,7 +152,13 @@ export function normalizeFhemDevice(raw: FhemRawDevice): FhemDevice {
 
   const isAutomation = ['at', 'doif', 'notify', 'watchdog', 'weekdaytimer'].includes(lowerType);
   const isScene = lowerType === 'lightscene' || lowerType === 'structure' || rooms.includes('Szenen');
-  const isSystem = lowerType === 'sysmon' || name === 'ZigBee_Bridge' || lowerType === 'fhemweb' || lowerType === 'global';
+  const isSystem =
+    lowerType === 'sysmon' ||
+    name === 'ZigBee_Bridge' ||
+    lowerType === 'fhemweb' ||
+    lowerType === 'global' ||
+    lowerType === 'filelog' ||
+    lowerType === 'dblog';
 
   const isThermostat =
     'desired-temp' in readings ||
@@ -907,6 +915,23 @@ class LocalFhemEngine {
           }
         }
       }
+      // Ensure built-in DbLog & FileLog devices exist in previously saved sandbox snapshots
+      const existingNames = new Set(saved.devices.map((d) => d.Name));
+      for (const seedLog of createSeedLogDevices()) {
+        if (!existingNames.has(seedLog.Name)) {
+          saved.devices.push(seedLog);
+        }
+      }
+      // Hydrate extended SYSMON readings on existing snapshots
+      const sysmonDev = saved.devices.find((d) => d.Name === 'FHEM_System');
+      if (sysmonDev) {
+        if (!sysmonDev.Readings.stat_cpu_percent) {
+          sysmonDev.Readings.stat_cpu_percent = {Value: '12.4 0.3 4.8 82.5', Time: ts};
+        }
+        if (!sysmonDev.Readings.fhemuptime_text) {
+          sysmonDev.Readings.fhemuptime_text = {Value: '14 Tage, 6 Std, 12 Min', Time: ts};
+        }
+      }
       this.state = saved;
     } else {
       this.state = {
@@ -1014,6 +1039,107 @@ class LocalFhemEngine {
     return s.unsavedChanges;
   }
 
+  private evaluateSafeReadingsValPerl(expr: string, state: SandboxState): string | null {
+    const lookupReading = (devName: string, readingKey: string): string | undefined => {
+      const dev = state.devices.find((d) => d.Name === devName);
+      if (!dev) return undefined;
+      const val = dev.Readings[readingKey]?.Value;
+      return val !== undefined && val !== '' ? val : undefined;
+    };
+
+    const splitTopLevelArgs = (input: string): string[] => {
+      const args: string[] = [];
+      let depth = 0;
+      let quote: '"' | "'" | null = null;
+      let current = '';
+      for (let i = 0; i < input.length; i++) {
+        const ch = input[i];
+        if (quote) {
+          current += ch;
+          if (ch === '\\' && i + 1 < input.length) {
+            current += input[++i];
+          } else if (ch === quote) {
+            quote = null;
+          }
+          continue;
+        }
+        if (ch === '"' || ch === "'") {
+          quote = ch;
+          current += ch;
+        } else if (ch === '(') {
+          depth++;
+          current += ch;
+        } else if (ch === ')') {
+          depth = Math.max(0, depth - 1);
+          current += ch;
+        } else if (ch === ',' && depth === 0) {
+          args.push(current.trim());
+          current = '';
+        } else {
+          current += ch;
+        }
+      }
+      if (current.trim()) args.push(current.trim());
+      return args;
+    };
+
+    const unquote = (token: string): string | null => {
+      const t = token.trim();
+      if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
+        return t.slice(1, -1).replace(/\\n/g, '\n');
+      }
+      return null;
+    };
+
+    const evalAtom = (token: string, depth = 0): string | null => {
+      if (depth > 8) return null;
+      const t = token.trim();
+      const literal = unquote(t);
+      if (literal !== null) return literal;
+
+      // "prefix=".ReadingsVal(...)
+      const concatMatch = t.match(/^("[^"]*"|'[^']*')\s*\.\s*(.+)$/);
+      if (concatMatch) {
+        const left = unquote(concatMatch[1]);
+        const right = evalAtom(concatMatch[2], depth + 1);
+        return left !== null && right !== null ? `${left}${right}` : null;
+      }
+
+      // ReadingsVal("dev","reading",fallbackExpr)
+      const rvMatch = t.match(/^readingsval\s*\(([\s\S]*)\)$/i);
+      if (rvMatch) {
+        const args = splitTopLevelArgs(rvMatch[1]);
+        if (args.length < 2 || args.length > 3) return null;
+        const devName = unquote(args[0]);
+        const readingKey = unquote(args[1]);
+        if (devName === null || readingKey === null) return null;
+        const found = lookupReading(devName, readingKey);
+        if (found !== undefined) return found;
+        return args[2] !== undefined ? evalAtom(args[2], depth + 1) : '';
+      }
+
+      return null;
+    };
+
+    // Support join("\n", expr1, expr2, ...)
+    const joinMatch = expr.match(/^join\s*\(([\s\S]*)\)$/i);
+    if (joinMatch) {
+      const args = splitTopLevelArgs(joinMatch[1]);
+      if (args.length < 2) return null;
+      const sep = unquote(args[0]);
+      if (sep === null) return null;
+      const parts: string[] = [];
+      for (let i = 1; i < args.length; i++) {
+        const val = evalAtom(args[i]);
+        if (val === null) return null;
+        parts.push(val);
+      }
+      return parts.join(sep);
+    }
+
+    return evalAtom(expr);
+  }
+
   async execute(cmd: string, config: FhemConnectionConfig): Promise<CommandExecutionResult> {
     const started = performance.now();
     const state = await this.ensureLoaded();
@@ -1085,6 +1211,14 @@ class LocalFhemEngine {
       return {ok: true, data: '42 days, 11:28:14', latencyMs: latency, statusCode: 200, requestUrlPreview: preview};
     }
 
+    // Safe evaluation of FHEM Perl ReadingsVal(...) expressions (single or batched join("\n", ...))
+    if (trimmed.startsWith('{') && trimmed.endsWith('}') && /readingsval\s*\(/i.test(trimmed)) {
+      const evaluated = this.evaluateSafeReadingsValPerl(trimmed.slice(1, -1).trim(), state);
+      if (evaluated !== null) {
+        return {ok: true, data: evaluated, latencyMs: latency, statusCode: 200, requestUrlPreview: preview};
+      }
+    }
+
     // save
     if (trimmed === 'save') {
       state.unsavedChanges = false;
@@ -1114,7 +1248,7 @@ class LocalFhemEngine {
       };
     }
 
-    // get <device> <reading>
+    // get <device> ...
     if (trimmed.startsWith('get ')) {
       const parts = trimmed.split(/\s+/);
       const devName = parts[1];
@@ -1127,6 +1261,85 @@ class LocalFhemEngine {
       if (!dev) {
         return {ok: false, data: '', latencyMs: latency, errorCode: 'DEVICE_NOT_FOUND', errorMessage: `Gerät „${devName}“ nicht gefunden.`, requestUrlPreview: preview};
       }
+
+      // Authentic FHEM DbLog / FileLog history protocol: get <logDev> - - <FROM> <TO> <spec>
+      const lowerLogType = (dev.Internals.TYPE || '').toLowerCase();
+      if ((lowerLogType === 'dblog' || lowerLogType === 'filelog') && parts.length >= 7 && parts[2] === '-' && parts[3] === '-') {
+        const fromMs = parseFhemLogTimestamp(parts[4]);
+        const toMs = parseFhemLogTimestamp(parts[5]);
+        const spec = parts.slice(6).join(' ').trim();
+        if (fromMs === null || toMs === null || !spec) {
+          return {
+            ok: false,
+            data: '',
+            latencyMs: latency,
+            errorCode: 'SYNTAX_ERROR',
+            errorMessage: 'Ungültiges Zeitformat oder Spaltenspezifikation für DbLog/FileLog.',
+            requestUrlPreview: preview,
+          };
+        }
+
+        let targetDevName = '';
+        let targetReadingKey = '';
+
+        if (lowerLogType === 'dblog') {
+          // Format: <deviceName>:<readingKey>
+          const colonIdx = spec.indexOf(':');
+          if (colonIdx > 0) {
+            targetDevName = spec.slice(0, colonIdx).trim();
+            targetReadingKey = spec.slice(colonIdx + 1).split(':')[0].trim();
+          }
+        } else {
+          // FileLog colspec format: 4:<device>.<reading>\x3a:: or 4:<device>.T\x3a::
+          const specParts = spec.split(':');
+          const rawRegexPart = (specParts[1] || '').replace(/\\x3a$/i, '').replace(/:$/, '');
+          // Split on the unescaped '.' separating <device> and <reading>
+          const unescapedDotMatch = rawRegexPart.match(/^(.*?(?:^|[^\\]))\.([^.].*)$/);
+          if (unescapedDotMatch) {
+            targetDevName = unescapedDotMatch[1].replace(/\\\./g, '.');
+            targetReadingKey = unescapedDotMatch[2].replace(/\\\./g, '.');
+          } else {
+            targetReadingKey = rawRegexPart.replace(/\\\./g, '.');
+          }
+        }
+
+        const targetDev = state.devices.find((d) => d.Name === targetDevName);
+        if (!targetDev || !targetReadingKey) {
+          return {ok: true, data: `#${spec}\n`, latencyMs: latency, statusCode: 200, requestUrlPreview: preview};
+        }
+
+        // For FileLog, enforce its configured REGEXP just like real 92_FileLog.pm
+        if (lowerLogType === 'filelog') {
+          const logRegexp = (dev.Internals.REGEXP || '').trim();
+          if (logRegexp) {
+            try {
+              const rx = new RegExp(logRegexp);
+              if (!rx.test(`${targetDev.Name}:${targetReadingKey}`) && !rx.test(`${targetDev.Name}:state`)) {
+                return {ok: true, data: `#${spec}\n`, latencyMs: latency, statusCode: 200, requestUrlPreview: preview};
+              }
+            } catch {
+              // ignore invalid regex
+            }
+          }
+        }
+
+        const rawReading = targetDev.Readings[targetReadingKey];
+        const currentNumeric = rawReading ? parseNumericReadingValue(rawReading.Value) : null;
+        if (currentNumeric === null) {
+          return {ok: true, data: `#${spec}\n`, latencyMs: latency, statusCode: 200, requestUrlPreview: preview};
+        }
+
+        const logOutput = generateAuthenticFhemLogOutput({
+          deviceName: targetDev.Name,
+          readingKey: targetReadingKey,
+          currentValue: currentNumeric,
+          fromMs,
+          toMs: Math.min(toMs, Date.now()),
+          footerLine: spec,
+        });
+        return {ok: true, data: logOutput, latencyMs: latency, statusCode: 200, requestUrlPreview: preview};
+      }
+
       const reading = dev.Readings[readingKey];
       const val = reading ? `${reading.Value} (${reading.Time})` : `Reading „${readingKey}“ nicht vorhanden`;
       this.pushEvent(state, dev.Name, dev.Internals.TYPE, `get ${readingKey} -> ${reading?.Value ?? 'n/a'}`, 'info');
@@ -1552,12 +1765,12 @@ export const localFhemEngine = new LocalFhemEngine();
 export async function executeFhemCommand(config: FhemConnectionConfig, cmd: string): Promise<CommandExecutionResult> {
   const preview = buildFhemEndpointUrl(config, cmd, true);
 
-  if (config.mode === 'local_instance') {
+  if (config.mode === 'local_instance' && !config.useServerUpstream) {
     return localFhemEngine.execute(cmd, config);
   }
 
-  // Remote FHEM Server Mode — Direct Browser LAN Fetch
-  if (config.transport === 'direct') {
+  // Remote FHEM Server Mode — Direct Browser LAN Fetch (never used for server-managed upstream)
+  if (config.transport === 'direct' && !config.useServerUpstream) {
     const started = performance.now();
     const basePath = config.basePath.startsWith('/') ? config.basePath : `/${config.basePath || 'fhem'}`;
     const baseUrl = `${config.protocol}://${config.host}:${config.port}${basePath}`;
@@ -1721,32 +1934,42 @@ export async function executeFhemCommand(config: FhemConnectionConfig, cmd: stri
   // Remote FHEM Server Mode — Express Backend Proxy (/api/fhem/execute)
   const started = performance.now();
   try {
+    const sessionToken = getActiveSessionToken();
     const response = await fetch('/api/fhem/execute', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-Requested-With': 'FHEM-Control-Desk',
+        ...(sessionToken ? {'X-Session-Token': sessionToken} : {}),
       },
-      body: JSON.stringify({
-        protocol: config.protocol,
-        host: config.host,
-        port: config.port,
-        basePath: config.basePath,
-        httpMethod: config.httpMethod,
-        cmd,
-        csrfMode: config.csrfMode,
-        csrfToken: config.csrfMode === 'manual' ? config.csrfToken : '',
-        authType: config.authType,
-        username: config.authType === 'basic' ? config.username : '',
-        password: config.authType === 'basic' ? config.password : '',
-        apiKey: config.authType === 'apikey' ? config.apiKey : '',
-        customHeaderName: config.authType === 'custom_header' ? config.customHeaderName : '',
-        customHeaderValue: config.authType === 'custom_header' ? config.customHeaderValue : '',
-        queryTokenParam: config.authType === 'query_token' ? config.queryTokenParam : '',
-        queryTokenValue: config.authType === 'query_token' ? config.queryTokenValue : '',
-        acceptSelfSigned: config.acceptSelfSigned,
-        timeoutMs: config.timeoutMs,
-      }),
+      body: JSON.stringify(
+        config.useServerUpstream
+          ? {
+              useServerUpstream: true,
+              cmd,
+              timeoutMs: config.timeoutMs,
+            }
+          : {
+              protocol: config.protocol,
+              host: config.host,
+              port: config.port,
+              basePath: config.basePath,
+              httpMethod: config.httpMethod,
+              cmd,
+              csrfMode: config.csrfMode,
+              csrfToken: config.csrfMode === 'manual' ? config.csrfToken : '',
+              authType: config.authType,
+              username: config.authType === 'basic' ? config.username : '',
+              password: config.authType === 'basic' ? config.password : '',
+              apiKey: config.authType === 'apikey' ? config.apiKey : '',
+              customHeaderName: config.authType === 'custom_header' ? config.customHeaderName : '',
+              customHeaderValue: config.authType === 'custom_header' ? config.customHeaderValue : '',
+              queryTokenParam: config.authType === 'query_token' ? config.queryTokenParam : '',
+              queryTokenValue: config.authType === 'query_token' ? config.queryTokenValue : '',
+              acceptSelfSigned: config.acceptSelfSigned,
+              timeoutMs: config.timeoutMs,
+            }
+      ),
     });
 
     const json = (await response.json()) as {
@@ -1998,6 +2221,7 @@ const PERMANENT_LONGPOLL_ERRORS = new Set([
   'INVALID_PATH',
   'INVALID_HEADER',
   'INVALID_QUERY_PARAM',
+  'UNAUTHORIZED',
 ]);
 
 export function startFhemLongpoll(
@@ -2036,7 +2260,7 @@ export function startFhemLongpoll(
   };
 
   // Mode 1: Local 200-Device Test Instance (instant live bus + realistic telemetry ticks)
-  if (config.mode === 'local_instance') {
+  if (config.mode === 'local_instance' && !config.useServerUpstream) {
     callbacks.onStateChange('connected');
     localUnsub = localFhemEngine.subscribe((update) => {
       if (!stopped) callbacks.onUpdate(update);
@@ -2074,31 +2298,40 @@ export function startFhemLongpoll(
 
     try {
       // Mode 2: Remote Server via Express SSE Proxy (/api/fhem/longpoll)
-      if (config.transport === 'proxy') {
+      if (config.transport === 'proxy' || config.useServerUpstream) {
+        const sessionToken = getActiveSessionToken();
         const response = await fetch('/api/fhem/longpoll', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'X-Requested-With': 'FHEM-Control-Desk',
+            ...(sessionToken ? {'X-Session-Token': sessionToken} : {}),
           },
-          body: JSON.stringify({
-            protocol: config.protocol,
-            host: config.host,
-            port: config.port,
-            basePath: config.basePath,
-            csrfMode: config.csrfMode,
-            csrfToken: config.csrfMode === 'manual' ? config.csrfToken : '',
-            authType: config.authType,
-            username: config.authType === 'basic' ? config.username : '',
-            password: config.authType === 'basic' ? config.password : '',
-            apiKey: config.authType === 'apikey' ? config.apiKey : '',
-            customHeaderName: config.authType === 'custom_header' ? config.customHeaderName : '',
-            customHeaderValue: config.authType === 'custom_header' ? config.customHeaderValue : '',
-            queryTokenParam: config.authType === 'query_token' ? config.queryTokenParam : '',
-            queryTokenValue: config.authType === 'query_token' ? config.queryTokenValue : '',
-            acceptSelfSigned: config.acceptSelfSigned,
-            timeoutMs: config.timeoutMs,
-          }),
+          body: JSON.stringify(
+            config.useServerUpstream
+              ? {
+                  useServerUpstream: true,
+                  timeoutMs: config.timeoutMs,
+                }
+              : {
+                  protocol: config.protocol,
+                  host: config.host,
+                  port: config.port,
+                  basePath: config.basePath,
+                  csrfMode: config.csrfMode,
+                  csrfToken: config.csrfMode === 'manual' ? config.csrfToken : '',
+                  authType: config.authType,
+                  username: config.authType === 'basic' ? config.username : '',
+                  password: config.authType === 'basic' ? config.password : '',
+                  apiKey: config.authType === 'apikey' ? config.apiKey : '',
+                  customHeaderName: config.authType === 'custom_header' ? config.customHeaderName : '',
+                  customHeaderValue: config.authType === 'custom_header' ? config.customHeaderValue : '',
+                  queryTokenParam: config.authType === 'query_token' ? config.queryTokenParam : '',
+                  queryTokenValue: config.authType === 'query_token' ? config.queryTokenValue : '',
+                  acceptSelfSigned: config.acceptSelfSigned,
+                  timeoutMs: config.timeoutMs,
+                }
+          ),
           signal: abortController.signal,
         });
 

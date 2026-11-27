@@ -12,6 +12,7 @@ import {
   ImagePlus,
   KeyRound,
   Lock,
+  Monitor,
   Pause,
   Play,
   PlusCircle,
@@ -24,14 +25,17 @@ import {
   Send,
   Server,
   ShieldCheck,
+  Smartphone,
   Sparkles,
   Sun,
   Terminal,
   Trash2,
+  Users,
   Wifi,
 } from 'lucide-react';
 import type {
   AppPreferences,
+  AuthStatus,
   ConnectionStatus,
   CustomMediaStore,
   FhemApiInterface,
@@ -42,10 +46,13 @@ import type {
   FhemEventItem,
   FhemLogEntry,
   MediaPickerTarget,
+  UserAccount,
+  ViewMode,
 } from '../types/fhem';
 import {buildFhemEndpointUrl} from '../lib/fhemClient';
 import {resolveRoomImage} from '../lib/roomVisuals';
 import {PWAInstallButton} from './PWAInstallButton';
+import {ProfileAdminSection} from './ProfileAdminSection';
 import {SmartVisualImage} from './SmartVisualImage';
 import {ThemeGallery} from './ThemePicker';
 
@@ -84,9 +91,20 @@ interface SettingsViewProps {
   onOpenDefineModal: () => void;
   onRequestResetLocalData: () => void;
   onOpenAiAssistant: () => void;
+  authStatus: AuthStatus;
+  currentUser: UserAccount | null;
+  profileSyncing: boolean;
+  lastProfileSyncedAt: string | null;
+  initialSection?: SettingsSection | null;
+  onClearInitialSection?: () => void;
+  onOpenAccountModal: () => void;
+  onPullProfile: () => Promise<void>;
+  onPushProfile: () => Promise<void>;
+  onLogout: () => Promise<void>;
+  onRefreshAuthStatus: () => Promise<void>;
 }
 
-type SettingsSection = 'connection' | 'admin' | 'logs' | 'app';
+export type SettingsSection = 'connection' | 'profile' | 'admin' | 'logs' | 'app';
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
   config,
@@ -113,10 +131,28 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onOpenDefineModal,
   onRequestResetLocalData,
   onOpenAiAssistant,
+  authStatus,
+  currentUser,
+  profileSyncing,
+  lastProfileSyncedAt,
+  initialSection,
+  onClearInitialSection,
+  onOpenAccountModal,
+  onPullProfile,
+  onPushProfile,
+  onLogout,
+  onRefreshAuthStatus,
 }) => {
-  const [section, setSection] = useState<SettingsSection>('connection');
+  const [section, setSection] = useState<SettingsSection>(initialSection || 'connection');
   const [draft, setDraft] = useState<FhemConnectionConfig>(config);
   const [showSecrets, setShowSecrets] = useState(false);
+
+  useEffect(() => {
+    if (initialSection) {
+      setSection(initialSection);
+      onClearInitialSection?.();
+    }
+  }, [initialSection, onClearInitialSection]);
 
   useEffect(() => {
     setDraft(config);
@@ -270,7 +306,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     setSaving(true);
     await onSaveConfig(draft);
     setSaving(false);
-    setTestFeedback({ok: true, message: 'Serverdaten lokal verschlüsselt gespeichert und aktiviert.'});
+    setTestFeedback({
+      ok: true,
+      message: draft.useServerUpstream
+        ? 'Verbindungseinstellungen (Longpoll, Polling & Timeout) gespeichert.'
+        : 'Serverdaten lokal verschlüsselt gespeichert und aktiviert.',
+    });
   };
 
   const runConsole = async (cmdOverride?: string) => {
@@ -302,10 +343,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       </div>
 
       {/* Section Tabs */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 rounded-2xl border theme-surface p-1.5">
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5 rounded-2xl border theme-surface p-1.5">
         {(
           [
             {id: 'connection', label: 'Server & Tresor', icon: Server},
+            {id: 'profile', label: 'Profil & Benutzer', icon: Users},
             {id: 'admin', label: 'Server-Admin', icon: Terminal},
             {id: 'logs', label: 'Events & Logfile', icon: FileText},
             {id: 'app', label: 'Design & Bilder', icon: Sun},
@@ -331,77 +373,179 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         })}
       </div>
 
+      {/* SECTION: PROFILE & USER MANAGEMENT */}
+      {section === 'profile' && (
+        <ProfileAdminSection
+          authStatus={authStatus}
+          currentUser={currentUser}
+          syncing={profileSyncing}
+          lastSyncedAt={lastProfileSyncedAt}
+          onOpenAccountModal={onOpenAccountModal}
+          onPullProfile={onPullProfile}
+          onPushProfile={onPushProfile}
+          onLogout={onLogout}
+          onRefreshAuthStatus={onRefreshAuthStatus}
+        />
+      )}
+
       {/* SECTION 1: CONNECTION & ENCRYPTED KEYSTORE */}
       {section === 'connection' && (
         <form onSubmit={handleSave} className="space-y-5">
-          {/* Operating Mode Switch */}
-          <div className="rounded-2xl border theme-surface p-5 space-y-4">
-            <div>
-              <h2 className="font-display text-base font-semibold text-slate-900 dark:text-slate-100">
-                Betriebsmodus
-              </h2>
-              <p className="text-xs text-slate-500 dark:text-slate-400">
-                Verbinde dich mit deinem lokalen FHEM-Server oder nutze die integrierte 200-Geräte-Testinstanz.
-              </p>
-            </div>
+          {/* Server-Managed FHEM Stack Banner (Exclusive or Optional Mode) */}
+          {authStatus.managedFhem?.enabled && (
+            <div className="rounded-2xl border border-[var(--accent-ring)] theme-surface p-5 space-y-3.5">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div className="flex items-start gap-3">
+                  <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl theme-tonal">
+                    <ShieldCheck className="h-5 w-5" />
+                  </span>
+                  <div>
+                    <h2 className="font-display text-base font-semibold text-slate-900 dark:text-slate-100">
+                      {authStatus.managedFhem.exclusive
+                        ? 'FHEM-Stack-Modus aktiv (Exklusive WebUI)'
+                        : 'FHEM-Stack-Server vorkonfiguriert'}
+                    </h2>
+                    <p className="mt-0.5 text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+                      {authStatus.managedFhem.exclusive
+                        ? 'Diese Instanz ist fest über die Server-Konfiguration (.env) an deinen FHEM-Server gebunden. Zugangsdaten verlassen den Server nicht und die Test-Instanz ist deaktiviert.'
+                        : 'Ein fester FHEM-Server ist im Stack vorkonfiguriert. Du kannst ihn direkt nutzen oder optional eine abweichende Verbindung testen.'}
+                    </p>
+                  </div>
+                </div>
+                <span className="rounded-xl theme-tonal px-2.5 py-1 font-mono text-[11px] font-semibold">
+                  {authStatus.managedFhem.exclusive ? 'Exklusiv' : 'Stack-Standard'}
+                </span>
+              </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <button
-                type="button"
-                onClick={() => setDraft((p) => ({...p, mode: 'local_instance'}))}
-                className={`flex flex-col items-start rounded-2xl border p-4 text-left transition-colors ${
-                  draft.mode === 'local_instance'
-                    ? 'border-[var(--accent-ring)] theme-tonal'
-                    : 'theme-border hover:bg-slate-50 dark:hover:bg-white/[0.04]'
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 rounded-2xl border theme-border bg-[var(--m3-canvas)]/70 p-3.5 text-xs">
+                <div>
+                  <div className="text-[11px] text-slate-500 dark:text-slate-400">FHEM-Ziel (intern)</div>
+                  <div className="mt-0.5 font-mono font-semibold text-slate-900 dark:text-slate-100 break-all">
+                    {authStatus.managedFhem.displayTarget || 'Server-Konfiguration'}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[11px] text-slate-500 dark:text-slate-400">Authentifizierung</div>
+                  <div className="mt-0.5 font-semibold text-slate-900 dark:text-slate-100">
+                    {authStatus.managedFhem.hasCredentials
+                      ? `Serverseitig geschützt (${authStatus.managedFhem.authType || 'aktiv'})`
+                      : 'Internes Netz (ohne Passwort)'}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[11px] text-slate-500 dark:text-slate-400">Methode & CSRF</div>
+                  <div className="mt-0.5 font-mono font-semibold text-slate-900 dark:text-slate-100">
+                    {authStatus.managedFhem.httpMethod || 'GET'} · CSRF {authStatus.managedFhem.csrfMode || 'auto'}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Operating Mode Switch (hidden when Exclusive Stack Mode locks the target) */}
+          {!authStatus.managedFhem?.exclusive && (
+            <div className="rounded-2xl border theme-surface p-5 space-y-4">
+              <div>
+                <h2 className="font-display text-base font-semibold text-slate-900 dark:text-slate-100">
+                  Betriebsmodus
+                </h2>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  Verbinde dich mit deinem lokalen FHEM-Server oder nutze die integrierte 200-Geräte-Testinstanz.
+                </p>
+              </div>
+
+              <div
+                className={`grid grid-cols-1 gap-3 ${
+                  authStatus.managedFhem?.enabled ? 'sm:grid-cols-3' : 'sm:grid-cols-2'
                 }`}
               >
-                <span className="text-sm font-semibold">
-                  Integrierte FHEM-Testinstanz
-                </span>
-                <span className="mt-1 text-xs opacity-80">
-                  201 Geräte (108 ZigBee), voll funktionsfähige set/get/attr/define/save-Engine.
-                </span>
-              </button>
+                {authStatus.managedFhem?.enabled && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setDraft((p) => ({
+                        ...p,
+                        mode: 'remote_server',
+                        transport: 'proxy',
+                        useServerUpstream: true,
+                        protocol: authStatus.managedFhem?.protocol || p.protocol,
+                        host: authStatus.managedFhem?.host || p.host,
+                        port: authStatus.managedFhem?.port || p.port,
+                        basePath: authStatus.managedFhem?.basePath || p.basePath,
+                      }))
+                    }
+                    className={`flex flex-col items-start rounded-2xl border p-4 text-left transition-colors ${
+                      draft.useServerUpstream
+                        ? 'border-[var(--accent-ring)] theme-tonal'
+                        : 'theme-border hover:bg-slate-50 dark:hover:bg-white/[0.04]'
+                    }`}
+                  >
+                    <span className="text-sm font-semibold">Stack-Server (.env)</span>
+                    <span className="mt-1 text-xs opacity-80">
+                      Nutzt direkt die serverseitig hinterlegte FHEM-Verbindung ({authStatus.managedFhem.displayTarget}).
+                    </span>
+                  </button>
+                )}
 
-              <button
-                type="button"
-                onClick={() => setDraft((p) => ({...p, mode: 'remote_server'}))}
-                className={`flex flex-col items-start rounded-2xl border p-4 text-left transition-colors ${
-                  draft.mode === 'remote_server'
-                    ? 'border-[var(--accent-ring)] theme-tonal'
-                    : 'theme-border hover:bg-slate-50 dark:hover:bg-white/[0.04]'
-                }`}
-              >
-                <span className="text-sm font-semibold">
-                  Echter FHEM-Server (HTTP / HTTPS)
-                </span>
-                <span className="mt-1 text-xs opacity-80">
-                  FHEMWEB, Reverse Proxy oder eigene API — mit frei wählbarer Authentifizierung (Basic Auth, API-Key, Custom Header, URL-Token) und CSRF-Modus.
-                </span>
-              </button>
+                <button
+                  type="button"
+                  onClick={() => setDraft((p) => ({...p, mode: 'local_instance', useServerUpstream: false}))}
+                  className={`flex flex-col items-start rounded-2xl border p-4 text-left transition-colors ${
+                    draft.mode === 'local_instance' && !draft.useServerUpstream
+                      ? 'border-[var(--accent-ring)] theme-tonal'
+                      : 'theme-border hover:bg-slate-50 dark:hover:bg-white/[0.04]'
+                  }`}
+                >
+                  <span className="text-sm font-semibold">
+                    Integrierte FHEM-Testinstanz
+                  </span>
+                  <span className="mt-1 text-xs opacity-80">
+                    201 Geräte (108 ZigBee), voll funktionsfähige set/get/attr/define/save-Engine.
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setDraft((p) => ({...p, mode: 'remote_server', useServerUpstream: false}))}
+                  className={`flex flex-col items-start rounded-2xl border p-4 text-left transition-colors ${
+                    draft.mode === 'remote_server' && !draft.useServerUpstream
+                      ? 'border-[var(--accent-ring)] theme-tonal'
+                      : 'theme-border hover:bg-slate-50 dark:hover:bg-white/[0.04]'
+                  }`}
+                >
+                  <span className="text-sm font-semibold">
+                    Eigener FHEM-Server (Manuell)
+                  </span>
+                  <span className="mt-1 text-xs opacity-80">
+                    FHEMWEB, Reverse Proxy oder eigene API — mit frei wählbarer Authentifizierung und CSRF-Modus.
+                  </span>
+                </button>
+              </div>
             </div>
-          </div>
+          )}
 
           {/* FHEM Connection Setup Wizard: Interface, Endpoint, Auth & CSRF */}
           <div className="rounded-2xl border theme-surface p-5 space-y-6">
-            <div className="flex items-center justify-between gap-2">
-              <div>
-                <h2 className="font-display text-base font-semibold text-slate-900 dark:text-slate-100">
-                  FHEM Verbindungs-Setup
-                </h2>
-                <p className="text-xs text-slate-500 dark:text-slate-400">
-                  Wähle Schnittstelle, Authentifizierung und CSRF-Verhalten passend zu deinem FHEM-Server.
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowSecrets((s) => !s)}
-                className="flex min-h-[38px] items-center gap-1.5 rounded-xl px-2.5 text-xs font-medium text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-[#1B222D] shrink-0"
-              >
-                {showSecrets ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                {showSecrets ? 'Verbergen' : 'Anzeigen'}
-              </button>
-            </div>
+            {!(authStatus.managedFhem?.exclusive || draft.useServerUpstream) && (
+              <>
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <h2 className="font-display text-base font-semibold text-slate-900 dark:text-slate-100">
+                      FHEM Verbindungs-Setup
+                    </h2>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">
+                      Wähle Schnittstelle, Authentifizierung und CSRF-Verhalten passend zu deinem FHEM-Server.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowSecrets((s) => !s)}
+                    className="flex min-h-[38px] items-center gap-1.5 rounded-xl px-2.5 text-xs font-medium text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-[#1B222D] shrink-0"
+                  >
+                    {showSecrets ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                    {showSecrets ? 'Verbergen' : 'Anzeigen'}
+                  </button>
+                </div>
 
             {/* Step 1: API Interface Selection */}
             <div className="space-y-2.5">
@@ -870,10 +1014,21 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               )}
             </div>
 
+              </>
+            )}
+
             {/* Echtzeit-Updates (FHEMWEB Longpoll) + Polling & Timeout */}
-            <div className="space-y-3 border-t theme-border pt-4">
+            <div
+              className={
+                authStatus.managedFhem?.exclusive || draft.useServerUpstream
+                  ? 'space-y-3'
+                  : 'space-y-3 border-t theme-border pt-4'
+              }
+            >
               <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                5. Echtzeit-Aktualisierung (Longpoll & Polling)
+                {authStatus.managedFhem?.exclusive || draft.useServerUpstream
+                  ? 'Echtzeit-Aktualisierung (Longpoll, Polling & Timeout)'
+                  : '5. Echtzeit-Aktualisierung (Longpoll & Polling)'}
               </div>
 
               <label className="flex min-h-[52px] cursor-pointer items-center justify-between gap-4 rounded-2xl theme-surface-alt px-4 py-3 border theme-border">
@@ -928,7 +1083,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </div>
             </div>
 
-            {draft.protocol === 'https' && (
+            {!(authStatus.managedFhem?.exclusive || draft.useServerUpstream) && draft.protocol === 'https' && (
               <label className="flex min-h-[48px] cursor-pointer items-center justify-between gap-4 rounded-2xl theme-surface-alt px-4 py-3 border theme-border">
                 <div>
                   <div className="text-sm font-medium text-slate-900 dark:text-slate-100">
@@ -948,30 +1103,32 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             )}
 
             {/* URL Pattern Preview */}
-            <div className="rounded-2xl theme-surface-alt px-3.5 py-2.5 border theme-border">
-              <div className="text-[11px] font-medium text-slate-500 dark:text-slate-400">
-                FHEMWEB Anfrage-Muster ({draft.httpMethod} ·{' '}
-                {draft.authType === 'basic'
-                  ? 'HTTP Basic Auth'
-                  : draft.authType === 'apikey'
-                    ? 'Bearer Header'
-                    : draft.authType === 'custom_header'
-                      ? `Header ${draft.customHeaderName || 'Custom'}`
-                      : draft.authType === 'query_token'
-                        ? `Query ?${draft.queryTokenParam || 'token'}`
-                        : 'Ohne Auth'}{' '}
-                ·{' '}
-                {draft.csrfMode === 'manual'
-                  ? 'Manuelles CSRF'
-                  : draft.csrfMode === 'auto'
-                    ? 'CSRF Automatisch'
-                    : 'Ohne CSRF'}
-                )
+            {!(authStatus.managedFhem?.exclusive || draft.useServerUpstream) && (
+              <div className="rounded-2xl theme-surface-alt px-3.5 py-2.5 border theme-border">
+                <div className="text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                  FHEMWEB Anfrage-Muster ({draft.httpMethod} ·{' '}
+                  {draft.authType === 'basic'
+                    ? 'HTTP Basic Auth'
+                    : draft.authType === 'apikey'
+                      ? 'Bearer Header'
+                      : draft.authType === 'custom_header'
+                        ? `Header ${draft.customHeaderName || 'Custom'}`
+                        : draft.authType === 'query_token'
+                          ? `Query ?${draft.queryTokenParam || 'token'}`
+                          : 'Ohne Auth'}{' '}
+                  ·{' '}
+                  {draft.csrfMode === 'manual'
+                    ? 'Manuelles CSRF'
+                    : draft.csrfMode === 'auto'
+                      ? 'CSRF Automatisch'
+                      : 'Ohne CSRF'}
+                  )
+                </div>
+                <code className="mt-1 block break-all font-mono text-xs theme-text">
+                  {endpointPreview}
+                </code>
               </div>
-              <code className="mt-1 block break-all font-mono text-xs theme-text">
-                {endpointPreview}
-              </code>
-            </div>
+            )}
 
             {/* Live Diagnostic Feedback */}
             {testFeedback && (
@@ -1402,6 +1559,69 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       {/* SECTION 4: DESIGN, THEMES, PWA & LOCAL DATA */}
       {section === 'app' && (
         <div className="space-y-4">
+          {/* Device-Dependent View Mode (Auto / Mobile / Desktop) */}
+          <div className="rounded-2xl border theme-surface p-5 space-y-3.5">
+            <div>
+              <h2 className="font-display text-base font-semibold text-slate-900 dark:text-slate-100">
+                Geräteabhängige Ansicht (Mobil & Desktop)
+              </h2>
+              <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                Wähle zwischen automatischer Geräteerkennung oder einer fest eingestellten Oberfläche für Smartphone bzw. Desktop-Browser.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+              {(
+                [
+                  {
+                    id: 'auto' as ViewMode,
+                    title: 'Automatisch',
+                    desc: 'Mobilansicht auf Smartphones (< 1024 px), volle Seitenleiste im Desktop-Browser.',
+                    icon: Smartphone,
+                  },
+                  {
+                    id: 'mobile' as ViewMode,
+                    title: 'Mobilansicht',
+                    desc: 'Kompakter Header, untere Tab-Leiste & einspaltige Touch-Kacheln.',
+                    icon: Smartphone,
+                  },
+                  {
+                    id: 'desktop' as ViewMode,
+                    title: 'Desktop-Ansicht',
+                    desc: 'Permanente linke Seitenleiste, Top-Bar & mehrspaltiges Dashboard.',
+                    icon: Monitor,
+                  },
+                ] as const
+              ).map((option) => {
+                const Icon = option.icon;
+                const active = (preferences.viewMode || 'auto') === option.id;
+                return (
+                  <button
+                    key={option.id}
+                    type="button"
+                    onClick={() => onUpdatePreferences({viewMode: option.id})}
+                    className={`flex flex-col items-start gap-1.5 rounded-2xl border p-3.5 text-left transition-colors ${
+                      active
+                        ? 'border-[var(--accent-ring)] theme-tonal'
+                        : 'theme-border bg-[var(--m3-canvas)]/70 hover:border-[var(--accent-ring)]'
+                    }`}
+                  >
+                    <div className="flex w-full items-center justify-between gap-2">
+                      <span className="flex items-center gap-2 text-sm font-semibold text-slate-900 dark:text-slate-100">
+                        <Icon className="h-4 w-4 theme-text shrink-0" />
+                        <span>{option.title}</span>
+                      </span>
+                      {active && <Check className="h-4 w-4 theme-text shrink-0" />}
+                    </div>
+                    <span className="text-[11px] leading-relaxed text-slate-600 dark:text-slate-400">
+                      {option.desc}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
           <div className="rounded-2xl border theme-surface p-5 space-y-5">
             <h2 className="font-display text-base font-semibold text-slate-900 dark:text-slate-100">
               Design & Farbthemes

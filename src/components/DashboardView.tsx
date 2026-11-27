@@ -8,6 +8,7 @@ import {
   FolderKanban,
   ImagePlus,
   LayoutGrid,
+  Lightbulb,
   LightbulbOff,
   Moon,
   Plus,
@@ -19,13 +20,24 @@ import {
   Sunrise,
   X,
 } from 'lucide-react';
-import type {CustomMediaStore, DashboardGrouping, FhemDevice, MediaPickerTarget, TileSize} from '../types/fhem';
+import type {
+  ConnectionStatus,
+  CustomMediaStore,
+  DashboardGrouping,
+  FhemConnectionConfig,
+  FhemDevice,
+  MediaPickerTarget,
+  TileSize,
+} from '../types/fhem';
 import {resolveDeviceImage, resolveRoomImage} from '../lib/roomVisuals';
 import {DeviceControlCard} from './DeviceControlCard';
+import {ServerHealthCard} from './ServerHealthCard';
 import {SmartVisualImage} from './SmartVisualImage';
 
 interface DashboardViewProps {
   devices: FhemDevice[];
+  config: FhemConnectionConfig;
+  connectionStatus?: ConnectionStatus;
   favorites: string[];
   compactCards: boolean;
   tileSizes: Record<string, TileSize>;
@@ -34,6 +46,7 @@ interface DashboardViewProps {
   showVisuals: boolean;
   customMedia: CustomMediaStore;
   refreshing: boolean;
+  isMobileView?: boolean;
   onRefresh: () => Promise<void>;
   onCommand: (cmd: string) => void;
   onOpenDetail: (device: FhemDevice) => void;
@@ -86,6 +99,8 @@ const TelemetryRing: React.FC<{ratio: number; strokeColor: string}> = ({ratio, s
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
   devices,
+  config,
+  connectionStatus,
   favorites,
   compactCards,
   tileSizes,
@@ -94,6 +109,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   showVisuals,
   customMedia,
   refreshing,
+  isMobileView = false,
   onRefresh,
   onCommand,
   onOpenDetail,
@@ -265,7 +281,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       onTouchStart={handleTouchStart}
       onTouchMove={handleTouchMove}
       onTouchEnd={handleTouchEnd}
-      className="space-y-6 pb-8"
+      className={isMobileView ? 'space-y-4 pb-6' : 'space-y-6 pb-8'}
     >
       {/* Pull-to-refresh visual indicator */}
       {pullDistance > 12 && (
@@ -278,155 +294,276 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       )}
 
-      {/* Home Overview Strip */}
-      <section aria-label="Systemübersicht" className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-        <div className="flex items-center justify-between gap-2 rounded-2xl border theme-surface p-4">
-          <div className="min-w-0">
-            <div className="text-xs font-medium text-slate-500 dark:text-slate-400">Aktive Lichter</div>
-            <div className="mt-1 font-display text-2xl font-bold tabular-nums text-emerald-600 dark:text-emerald-400">
-              {metrics.activeLightsCount}
-              <span className="text-sm font-medium text-slate-400">/{metrics.lightsTotal}</span>
+      {/* Home Overview Strip — Dedicated Mobile vs Desktop Layout */}
+      {isMobileView ? (
+        <section aria-label="Systemübersicht" className="grid grid-cols-2 gap-2.5">
+          <div className="min-w-0 rounded-2xl border theme-surface p-3.5">
+            <div className="flex items-center justify-between gap-1.5">
+              <span className="truncate text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                Lichter aktiv
+              </span>
+              <Lightbulb className="h-3.5 w-3.5 shrink-0 text-emerald-500" />
             </div>
-            <div className="mt-1 text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+            <div className="mt-1 font-display text-xl font-bold tabular-nums leading-tight text-emerald-600 dark:text-emerald-400">
+              {metrics.activeLightsCount}
+              <span className="text-xs font-medium text-slate-400">/{metrics.lightsTotal}</span>
+            </div>
+            <div className="mt-1 truncate text-[11px] tabular-nums text-slate-500 dark:text-slate-400">
               {metrics.total} Geräte gesamt
             </div>
           </div>
-          {showVisuals && (
-            <TelemetryRing
-              ratio={metrics.lightsTotal > 0 ? metrics.activeLightsCount / metrics.lightsTotal : 0}
-              strokeColor="#10B981"
-            />
-          )}
-        </div>
 
-        <div className="flex items-center justify-between gap-2 rounded-2xl border theme-surface p-4">
-          <div className="min-w-0">
-            <div className="flex items-center gap-1.5">
-              <span className="text-xs font-medium text-slate-500 dark:text-slate-400">ZigBee Mesh</span>
-              <Radio className="h-3.5 w-3.5 theme-text" />
+          <div className="min-w-0 rounded-2xl border theme-surface p-3.5">
+            <div className="flex items-center justify-between gap-1.5">
+              <span className="truncate text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                ZigBee Mesh
+              </span>
+              <Radio className="h-3.5 w-3.5 shrink-0 theme-text" />
             </div>
-            <div className="mt-1 font-display text-2xl font-bold tabular-nums text-slate-900 dark:text-slate-100">
+            <div className="mt-1 font-display text-xl font-bold tabular-nums leading-tight text-slate-900 dark:text-slate-100">
               {metrics.zigbeeCount}
             </div>
-            <div className="mt-1 text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-              {metrics.lowBatCount > 0 ? `${metrics.lowBatCount} Batterie schwach` : 'Alle Batterien OK'}
+            <div className="mt-1 truncate text-[11px] tabular-nums text-slate-500 dark:text-slate-400">
+              {metrics.lowBatCount > 0 ? `${metrics.lowBatCount} Batterie schwach` : 'Batterien OK'}
             </div>
           </div>
-          {showVisuals && (
-            <TelemetryRing
-              ratio={metrics.total > 0 ? metrics.zigbeeCount / metrics.total : 0}
-              strokeColor="var(--accent-primary)"
-            />
-          )}
-        </div>
 
-        <button
-          type="button"
-          onClick={onJumpToCalendar}
-          className="flex items-center justify-between gap-2 rounded-2xl border theme-surface p-4 text-left transition-colors hover:border-[var(--accent-ring)]"
-        >
-          <div className="min-w-0">
-            <div className="flex items-center gap-1.5">
-              <span className="text-xs font-medium text-slate-500 dark:text-slate-400">Automationen</span>
-              <CalendarClock className="h-3.5 w-3.5 text-slate-400" />
+          <button
+            type="button"
+            onClick={onJumpToCalendar}
+            className="min-w-0 rounded-2xl border theme-surface p-3.5 text-left transition-colors active:border-[var(--accent-ring)]"
+          >
+            <div className="flex items-center justify-between gap-1.5">
+              <span className="truncate text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                Automationen
+              </span>
+              <CalendarClock className="h-3.5 w-3.5 shrink-0 text-indigo-500 dark:text-indigo-400" />
             </div>
-            <div className="mt-1 font-display text-2xl font-bold tabular-nums text-slate-900 dark:text-slate-100">
-              {metrics.automationActive}/{metrics.automationTotal}
+            <div className="mt-1 font-display text-xl font-bold tabular-nums leading-tight text-slate-900 dark:text-slate-100">
+              {metrics.automationActive}
+              <span className="text-xs font-medium text-slate-400">/{metrics.automationTotal}</span>
             </div>
-            <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-              at · DOIF · WeekdayTimer
+            <div className="mt-1 truncate text-[11px] text-slate-500 dark:text-slate-400">
+              at · DOIF · Timer
             </div>
-          </div>
-          {showVisuals && (
-            <TelemetryRing
-              ratio={metrics.automationTotal > 0 ? metrics.automationActive / metrics.automationTotal : 0}
-              strokeColor="#6366F1"
-            />
-          )}
-        </button>
+          </button>
 
-        <button
-          type="button"
-          onClick={onJumpToErrors}
-          className={`flex flex-col justify-between rounded-2xl border bg-[var(--m3-surface)] p-4 text-left transition-colors ${
-            metrics.errorCount > 0
-              ? 'border-red-300/80 hover:border-red-400 dark:border-red-500/40'
-              : 'theme-border hover:border-[var(--accent-ring)]'
-          }`}
-        >
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-medium text-slate-500 dark:text-slate-400">Systemstatus</span>
-            {metrics.errorCount > 0 && <AlertTriangle className="h-4 w-4 text-red-500" />}
-          </div>
-          <div
-            className={`mt-1 font-display text-2xl font-bold tabular-nums ${
+          <button
+            type="button"
+            onClick={onJumpToErrors}
+            className={`min-w-0 rounded-2xl border bg-[var(--m3-surface)] p-3.5 text-left transition-colors ${
               metrics.errorCount > 0
-                ? 'text-red-600 dark:text-red-400'
-                : 'text-emerald-600 dark:text-emerald-400'
+                ? 'border-red-300/80 dark:border-red-500/40'
+                : 'theme-border active:border-[var(--accent-ring)]'
             }`}
           >
-            {metrics.errorCount > 0 ? `${metrics.errorCount} Störung` : 'Alles OK'}
-          </div>
-          <div className="mt-1.5 space-y-1">
-            <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-              <span>Steckdosen</span>
-              <span className="font-mono font-semibold text-slate-700 dark:text-slate-200">
-                {metrics.totalPower.toFixed(0)} W
+            <div className="flex items-center justify-between gap-1.5">
+              <span className="truncate text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                Systemstatus
               </span>
+              {metrics.errorCount > 0 && <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-red-500" />}
+            </div>
+            <div
+              className={`mt-1 truncate font-display text-xl font-bold tabular-nums leading-tight ${
+                metrics.errorCount > 0
+                  ? 'text-red-600 dark:text-red-400'
+                  : 'text-emerald-600 dark:text-emerald-400'
+              }`}
+            >
+              {metrics.errorCount > 0 ? `${metrics.errorCount} Störung` : 'Alles OK'}
+            </div>
+            <div className="mt-1 truncate text-[11px] tabular-nums text-slate-500 dark:text-slate-400">
+              Leistung: <span className="font-mono font-semibold text-slate-700 dark:text-slate-200">{metrics.totalPower.toFixed(0)} W</span>
+            </div>
+          </button>
+        </section>
+      ) : (
+        <section aria-label="Systemübersicht" className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+          <div className="flex items-center justify-between gap-2 rounded-2xl border theme-surface p-4">
+            <div className="min-w-0">
+              <div className="text-xs font-medium text-slate-500 dark:text-slate-400">Aktive Lichter</div>
+              <div className="mt-1 font-display text-2xl font-bold tabular-nums text-emerald-600 dark:text-emerald-400">
+                {metrics.activeLightsCount}
+                <span className="text-sm font-medium text-slate-400">/{metrics.lightsTotal}</span>
+              </div>
+              <div className="mt-1 text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                {metrics.total} Geräte gesamt
+              </div>
             </div>
             {showVisuals && (
-              <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-200/80 dark:bg-white/10">
-                <div
-                  className="h-full rounded-full transition-all"
-                  style={{
-                    width: `${Math.min(100, Math.max(6, (metrics.totalPower / 2500) * 100))}%`,
-                    backgroundColor: metrics.totalPower > 1800 ? '#F59E0B' : 'var(--accent-primary)',
-                  }}
-                />
-              </div>
+              <TelemetryRing
+                ratio={metrics.lightsTotal > 0 ? metrics.activeLightsCount / metrics.lightsTotal : 0}
+                strokeColor="#10B981"
+              />
             )}
           </div>
-        </button>
-      </section>
+
+          <div className="flex items-center justify-between gap-2 rounded-2xl border theme-surface p-4">
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs font-medium text-slate-500 dark:text-slate-400">ZigBee Mesh</span>
+                <Radio className="h-3.5 w-3.5 theme-text" />
+              </div>
+              <div className="mt-1 font-display text-2xl font-bold tabular-nums text-slate-900 dark:text-slate-100">
+                {metrics.zigbeeCount}
+              </div>
+              <div className="mt-1 text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                {metrics.lowBatCount > 0 ? `${metrics.lowBatCount} Batterie schwach` : 'Alle Batterien OK'}
+              </div>
+            </div>
+            {showVisuals && (
+              <TelemetryRing
+                ratio={metrics.total > 0 ? metrics.zigbeeCount / metrics.total : 0}
+                strokeColor="var(--accent-primary)"
+              />
+            )}
+          </div>
+
+          <button
+            type="button"
+            onClick={onJumpToCalendar}
+            className="flex items-center justify-between gap-2 rounded-2xl border theme-surface p-4 text-left transition-colors hover:border-[var(--accent-ring)]"
+          >
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs font-medium text-slate-500 dark:text-slate-400">Automationen</span>
+                <CalendarClock className="h-3.5 w-3.5 text-slate-400" />
+              </div>
+              <div className="mt-1 font-display text-2xl font-bold tabular-nums text-slate-900 dark:text-slate-100">
+                {metrics.automationActive}/{metrics.automationTotal}
+              </div>
+              <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                at · DOIF · WeekdayTimer
+              </div>
+            </div>
+            {showVisuals && (
+              <TelemetryRing
+                ratio={metrics.automationTotal > 0 ? metrics.automationActive / metrics.automationTotal : 0}
+                strokeColor="#6366F1"
+              />
+            )}
+          </button>
+
+          <button
+            type="button"
+            onClick={onJumpToErrors}
+            className={`flex flex-col justify-between rounded-2xl border bg-[var(--m3-surface)] p-4 text-left transition-colors ${
+              metrics.errorCount > 0
+                ? 'border-red-300/80 hover:border-red-400 dark:border-red-500/40'
+                : 'theme-border hover:border-[var(--accent-ring)]'
+            }`}
+          >
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-medium text-slate-500 dark:text-slate-400">Systemstatus</span>
+              {metrics.errorCount > 0 && <AlertTriangle className="h-4 w-4 text-red-500" />}
+            </div>
+            <div
+              className={`mt-1 font-display text-2xl font-bold tabular-nums ${
+                metrics.errorCount > 0
+                  ? 'text-red-600 dark:text-red-400'
+                  : 'text-emerald-600 dark:text-emerald-400'
+              }`}
+            >
+              {metrics.errorCount > 0 ? `${metrics.errorCount} Störung` : 'Alles OK'}
+            </div>
+            <div className="mt-1.5 space-y-1">
+              <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                <span>Steckdosen</span>
+                <span className="font-mono font-semibold text-slate-700 dark:text-slate-200">
+                  {metrics.totalPower.toFixed(0)} W
+                </span>
+              </div>
+              {showVisuals && (
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-200/80 dark:bg-white/10">
+                  <div
+                    className="h-full rounded-full transition-all"
+                    style={{
+                      width: `${Math.min(100, Math.max(6, (metrics.totalPower / 2500) * 100))}%`,
+                      backgroundColor: metrics.totalPower > 1800 ? '#F59E0B' : 'var(--accent-primary)',
+                    }}
+                  />
+                </div>
+              )}
+            </div>
+          </button>
+        </section>
+      )}
+
+      {/* FHEM Server Health Card (CPU, RAM, Uptime via FHEM ReadingsVal) */}
+      <ServerHealthCard
+        devices={devices}
+        config={config}
+        connectionStatus={connectionStatus}
+        showVisuals={showVisuals}
+        isMobileView={isMobileView}
+        onOpenDetail={onOpenDetail}
+      />
 
       {/* Quick Scenes */}
       <section aria-label="Schnellszenen">
-        <div className="mb-2.5 flex items-center justify-between">
-          <h2 className="font-display text-base font-semibold text-slate-900 dark:text-slate-100">
+        <div className="mb-2 flex items-center justify-between">
+          <h2 className={`font-display font-semibold text-slate-900 dark:text-slate-100 ${isMobileView ? 'text-sm' : 'text-base'}`}>
             Schnellzugriff & Szenen
           </h2>
         </div>
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
-          {quickScenes.map((scene) => {
-            const Icon = scene.icon;
-            return (
-              <button
-                key={scene.label}
-                type="button"
-                onClick={scene.action}
-                className="flex min-h-[52px] items-center gap-3 rounded-2xl border theme-surface px-4 py-3 text-left text-sm font-semibold text-slate-800 transition-colors hover:border-[var(--accent-ring)] active:scale-[0.98] dark:text-slate-100"
-              >
-                <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl theme-tonal">
-                  <Icon className="h-4.5 w-4.5" />
-                </span>
-                <span className="truncate">{scene.label}</span>
-              </button>
-            );
-          })}
-        </div>
+        {isMobileView ? (
+          <div className="flex gap-2 overflow-x-auto pb-1 snap-x">
+            {quickScenes.map((scene) => {
+              const Icon = scene.icon;
+              return (
+                <button
+                  key={scene.label}
+                  type="button"
+                  onClick={scene.action}
+                  className="flex min-h-[44px] shrink-0 snap-start items-center gap-2 rounded-2xl border theme-surface px-3 py-2 text-left text-xs font-semibold text-slate-800 whitespace-nowrap transition-colors active:scale-[0.98] dark:text-slate-100"
+                >
+                  <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg theme-tonal">
+                    <Icon className="h-3.5 w-3.5" />
+                  </span>
+                  <span>{scene.label}</span>
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+            {quickScenes.map((scene) => {
+              const Icon = scene.icon;
+              return (
+                <button
+                  key={scene.label}
+                  type="button"
+                  onClick={scene.action}
+                  className="flex min-h-[52px] items-center gap-3 rounded-2xl border theme-surface px-4 py-3 text-left text-sm font-semibold text-slate-800 transition-colors hover:border-[var(--accent-ring)] active:scale-[0.98] dark:text-slate-100"
+                >
+                  <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl theme-tonal">
+                    <Icon className="h-4.5 w-4.5" />
+                  </span>
+                  <span className="truncate">{scene.label}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
       </section>
 
       {/* Primary Rooms Summary */}
       <section aria-label="Hauptraum-Übersicht">
-        <div className="mb-2.5 flex items-center justify-between">
-          <h2 className="font-display text-base font-semibold text-slate-900 dark:text-slate-100">
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <h2 className={`font-display font-semibold text-slate-900 dark:text-slate-100 ${isMobileView ? 'text-sm' : 'text-base'}`}>
             Hauptraum-Übersicht
           </h2>
-          <span className="text-xs text-slate-500 dark:text-slate-400">
-            Tippen für Raumansicht
+          <span className="text-[11px] text-slate-500 dark:text-slate-400">
+            {isMobileView ? 'Wischen & tippen' : 'Tippen für Raumansicht'}
           </span>
         </div>
-        <div className="flex gap-3 overflow-x-auto pb-1 lg:grid lg:grid-cols-4 lg:overflow-visible">
+        <div
+          className={
+            isMobileView
+              ? 'flex gap-2.5 overflow-x-auto pb-1 snap-x snap-mandatory'
+              : 'grid grid-cols-2 lg:grid-cols-4 gap-3'
+          }
+        >
           {roomSummaries.map((r) => {
             const roomImg = showVisuals ? resolveRoomImage(r.room, customMedia) : null;
             if (showVisuals) {
@@ -435,7 +572,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   key={r.room}
                   type="button"
                   onClick={() => onJumpToRoom(r.room)}
-                  className="group relative flex h-40 min-w-[216px] lg:min-w-0 flex-col justify-between overflow-hidden rounded-2xl border theme-border p-3.5 text-left transition-all hover:border-[var(--accent-ring)]"
+                  className={`group relative flex flex-col justify-between overflow-hidden rounded-2xl border theme-border p-3.5 text-left transition-all hover:border-[var(--accent-ring)] ${
+                    isMobileView
+                      ? 'h-36 w-[68vw] max-w-[235px] shrink-0 snap-start'
+                      : 'h-40 min-w-0'
+                  }`}
                 >
                   <SmartVisualImage
                     src={roomImg?.src ?? null}
@@ -456,10 +597,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
                   <div className="relative z-10 space-y-1 text-white">
                     <div className="flex items-baseline justify-between gap-2">
-                      <span className="font-display text-2xl font-bold tabular-nums drop-shadow-xs">
+                      <span className={`font-display font-bold tabular-nums drop-shadow-xs ${isMobileView ? 'text-xl' : 'text-2xl'}`}>
                         {r.avgTemp !== null ? `${r.avgTemp.toFixed(1)} °C` : `${r.count} Ger.`}
                       </span>
-                      <span className="text-xs tabular-nums text-white/80">
+                      <span className="text-xs tabular-nums text-white/80 whitespace-nowrap">
                         {r.count} Geräte
                       </span>
                     </div>
@@ -494,7 +635,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 key={r.room}
                 type="button"
                 onClick={() => onJumpToRoom(r.room)}
-                className="flex min-w-[186px] lg:min-w-0 flex-col justify-between rounded-2xl border theme-surface p-3.5 text-left transition-colors hover:border-[var(--accent-ring)]"
+                className={`flex flex-col justify-between rounded-2xl border theme-surface p-3.5 text-left transition-colors hover:border-[var(--accent-ring)] ${
+                  isMobileView ? 'w-[62vw] max-w-[210px] shrink-0 snap-start' : 'min-w-0'
+                }`}
               >
                 <div className="flex items-center justify-between gap-2">
                   <span className="font-display text-sm font-semibold text-slate-900 dark:text-slate-100 truncate">
@@ -502,12 +645,12 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   </span>
                   <ChevronRight className="h-4 w-4 shrink-0 text-slate-400" />
                 </div>
-                <div className="mt-2 flex items-baseline justify-between">
+                <div className="mt-2 flex items-baseline justify-between gap-2">
                   <span className="font-display text-xl font-bold tabular-nums text-slate-900 dark:text-slate-100">
                     {r.avgTemp !== null ? `${r.avgTemp.toFixed(1)} °C` : `${r.count} Ger.`}
                   </span>
-                  <span className="text-xs tabular-nums text-slate-500 dark:text-slate-400">
-                    {r.count} Geräte
+                  <span className="text-xs tabular-nums text-slate-500 dark:text-slate-400 whitespace-nowrap">
+                    {r.count} Ger.
                   </span>
                 </div>
                 <div className="mt-2 flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
@@ -540,7 +683,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       {/* Optional User-Uploaded Floorplan / House Visual Banner */}
       {showVisuals && customMedia.floorplan && (
         <section aria-label="Haus-Grundriss" className="rounded-3xl border theme-surface overflow-hidden">
-          <div className="relative h-56 sm:h-64 w-full">
+          <div className={`relative w-full ${isMobileView ? 'h-44' : 'h-56 sm:h-64'}`}>
             <SmartVisualImage
               src={customMedia.floorplan}
               alt="Eigener Haus-Grundriss"
@@ -548,10 +691,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               className="h-full w-full"
             />
             <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/80 via-black/25 to-transparent" />
-            <div className="absolute bottom-4 left-4 right-4 flex items-end justify-between gap-3 text-white">
-              <div>
-                <h2 className="font-display text-base font-bold">Haus-Grundriss & Ansicht</h2>
-                <p className="text-xs text-white/80">Eigenes Dashboard-Bild aus dem lokalen Medienspeicher</p>
+            <div className="absolute bottom-3.5 left-3.5 right-3.5 flex items-end justify-between gap-3 text-white">
+              <div className="min-w-0">
+                <h2 className="font-display text-sm sm:text-base font-bold truncate">Haus-Grundriss & Ansicht</h2>
+                <p className="text-[11px] sm:text-xs text-white/80 truncate">Eigenes Dashboard-Bild aus dem lokalen Medienspeicher</p>
               </div>
               <button
                 type="button"
@@ -559,7 +702,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 className="flex min-h-[38px] items-center gap-1.5 rounded-xl bg-black/60 px-3 text-xs font-semibold text-white backdrop-blur-xs hover:bg-black/80 shrink-0"
               >
                 <ImagePlus className="h-3.5 w-3.5" />
-                Bild ändern
+                <span>Ändern</span>
               </button>
             </div>
           </div>
@@ -568,98 +711,191 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
       {/* Customizable Favorite Widgets (EasyTiley + fhemApp appOptions) */}
       <section aria-label="Favoriten-Kacheln">
-        <div className="mb-3 flex flex-wrap items-center justify-between gap-2.5">
-          <div>
-            <h2 className="font-display text-base font-semibold text-slate-900 dark:text-slate-100">
-              Favoriten-Kacheln
-            </h2>
-            <p className="text-xs text-slate-500 dark:text-slate-400">
-              {editMode
-                ? 'Kacheln per Drag & Drop sortieren oder zwischen 1×1 und 2×1 Breite umschalten'
-                : `${favoriteDevices.length} angeheftet · ${dashboardGrouping === 'rooms' ? 'Raum-Boxen' : 'Freies Raster'}${compactCards ? ' · Tablet-Kompakt' : ''}`}
-            </p>
-          </div>
-          <div className="flex flex-wrap items-center gap-1.5">
-            {/* Grid vs Room-Boxes Grouping Toggle (EasyTiley) */}
-            <div className="inline-flex rounded-xl border theme-border bg-[var(--m3-surface)] p-0.5">
-              <button
-                type="button"
-                onClick={() => onChangeGrouping('grid')}
-                title="Freies Kachelraster"
-                className={`flex min-h-[38px] items-center gap-1.5 rounded-lg px-2.5 text-xs font-semibold transition-colors ${
-                  dashboardGrouping === 'grid'
-                    ? 'theme-tonal'
-                    : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200'
-                }`}
-              >
-                <LayoutGrid className="h-3.5 w-3.5" />
-                <span className="hidden sm:inline">Kacheln</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => onChangeGrouping('rooms')}
-                title="Nach Raum-Boxen gruppieren"
-                className={`flex min-h-[38px] items-center gap-1.5 rounded-lg px-2.5 text-xs font-semibold transition-colors ${
-                  dashboardGrouping === 'rooms'
-                    ? 'theme-tonal'
-                    : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200'
-                }`}
-              >
-                <FolderKanban className="h-3.5 w-3.5" />
-                <span className="hidden sm:inline">Raum-Boxen</span>
-              </button>
+        {isMobileView ? (
+          <div className="mb-3 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <h2 className="font-display text-sm font-semibold text-slate-900 dark:text-slate-100 truncate">
+                  Favoriten ({favoriteDevices.length})
+                </h2>
+                <p className="truncate text-[11px] text-slate-500 dark:text-slate-400">
+                  {editMode
+                    ? 'Sortieren, gruppieren oder Kachelgröße ändern'
+                    : dashboardGrouping === 'rooms'
+                      ? 'Nach Räumen gruppiert'
+                      : 'Direktzugriff auf deine wichtigsten Geräte'}
+                </p>
+              </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setPickerOpen(true)}
+                  aria-label="Favorit hinzufügen"
+                  className="flex h-10 w-10 items-center justify-center rounded-xl theme-tonal transition-opacity active:opacity-80"
+                >
+                  <Plus className="h-4.5 w-4.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setEditMode((v) => !v)}
+                  className={`flex min-h-[40px] items-center gap-1.5 rounded-xl px-3 text-xs font-semibold transition-colors whitespace-nowrap ${
+                    editMode
+                      ? 'theme-btn-primary'
+                      : 'theme-surface-alt text-slate-700 dark:text-slate-200'
+                  }`}
+                >
+                  {editMode ? <Check className="h-4 w-4" /> : <SlidersHorizontal className="h-3.5 w-3.5" />}
+                  <span>{editMode ? 'Fertig' : 'Anpassen'}</span>
+                </button>
+              </div>
             </div>
 
-            {/* Wall-Tablet Compact Density Toggle */}
-            <button
-              type="button"
-              onClick={onToggleCompactCards}
-              title="Kompakte Wand-Tablet-Ansicht umschalten"
-              className={`flex min-h-[40px] items-center gap-1.5 rounded-xl px-3 text-xs font-semibold transition-colors whitespace-nowrap ${
-                compactCards
-                  ? 'theme-tonal border border-[var(--accent-ring)]'
-                  : 'theme-surface-alt text-slate-700 hover:opacity-85 dark:text-slate-200'
-              }`}
-            >
-              <Rows3 className="h-3.5 w-3.5" />
-              <span className="hidden md:inline">Kompakt</span>
-            </button>
+            {/* Secondary edit options revealed only when customizing on mobile */}
+            {editMode && (
+              <div className="flex flex-wrap items-center gap-1.5 rounded-2xl border theme-border bg-[var(--m3-surface)] p-2">
+                <div className="inline-flex rounded-xl border theme-border bg-[var(--m3-canvas)] p-0.5">
+                  <button
+                    type="button"
+                    onClick={() => onChangeGrouping('grid')}
+                    className={`flex min-h-[36px] items-center gap-1.5 rounded-lg px-2.5 text-xs font-semibold ${
+                      dashboardGrouping === 'grid' ? 'theme-tonal' : 'text-slate-500 dark:text-slate-400'
+                    }`}
+                  >
+                    <LayoutGrid className="h-3.5 w-3.5" />
+                    <span>Liste</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onChangeGrouping('rooms')}
+                    className={`flex min-h-[36px] items-center gap-1.5 rounded-lg px-2.5 text-xs font-semibold ${
+                      dashboardGrouping === 'rooms' ? 'theme-tonal' : 'text-slate-500 dark:text-slate-400'
+                    }`}
+                  >
+                    <FolderKanban className="h-3.5 w-3.5" />
+                    <span>Räume</span>
+                  </button>
+                </div>
 
-            {/* fhemApp appOptions Sync Button */}
-            {appOptionsDashboardCount > 0 && (
+                <button
+                  type="button"
+                  onClick={onToggleCompactCards}
+                  className={`flex min-h-[38px] items-center gap-1.5 rounded-xl px-2.5 text-xs font-semibold ${
+                    compactCards
+                      ? 'theme-tonal border border-[var(--accent-ring)]'
+                      : 'theme-surface-alt text-slate-700 dark:text-slate-200'
+                  }`}
+                >
+                  <Rows3 className="h-3.5 w-3.5" />
+                  <span>Kompakt</span>
+                </button>
+
+                {appOptionsDashboardCount > 0 && (
+                  <button
+                    type="button"
+                    onClick={onSyncFromAppOptions}
+                    className="flex min-h-[38px] items-center gap-1.5 rounded-xl theme-surface-alt px-2.5 text-xs font-semibold text-slate-700 dark:text-slate-200"
+                  >
+                    <Sparkles className="h-3.5 w-3.5 theme-text" />
+                    <span>appOptions</span>
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2.5">
+            <div>
+              <h2 className="font-display text-base font-semibold text-slate-900 dark:text-slate-100">
+                Favoriten-Kacheln
+              </h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                {editMode
+                  ? 'Kacheln per Drag & Drop sortieren oder zwischen 1×1 und 2×1 Breite umschalten'
+                  : `${favoriteDevices.length} angeheftet · ${dashboardGrouping === 'rooms' ? 'Raum-Boxen' : 'Freies Raster'}${compactCards ? ' · Tablet-Kompakt' : ''}`}
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {/* Grid vs Room-Boxes Grouping Toggle (EasyTiley) */}
+              <div className="inline-flex rounded-xl border theme-border bg-[var(--m3-surface)] p-0.5">
+                <button
+                  type="button"
+                  onClick={() => onChangeGrouping('grid')}
+                  title="Freies Kachelraster"
+                  className={`flex min-h-[38px] items-center gap-1.5 rounded-lg px-2.5 text-xs font-semibold transition-colors ${
+                    dashboardGrouping === 'grid'
+                      ? 'theme-tonal'
+                      : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200'
+                  }`}
+                >
+                  <LayoutGrid className="h-3.5 w-3.5" />
+                  <span>Kacheln</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onChangeGrouping('rooms')}
+                  title="Nach Raum-Boxen gruppieren"
+                  className={`flex min-h-[38px] items-center gap-1.5 rounded-lg px-2.5 text-xs font-semibold transition-colors ${
+                    dashboardGrouping === 'rooms'
+                      ? 'theme-tonal'
+                      : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200'
+                  }`}
+                >
+                  <FolderKanban className="h-3.5 w-3.5" />
+                  <span>Raum-Boxen</span>
+                </button>
+              </div>
+
+              {/* Wall-Tablet Compact Density Toggle */}
               <button
                 type="button"
-                onClick={onSyncFromAppOptions}
-                title={`Übernimmt ${appOptionsDashboardCount} FHEM-Geräte mit appOptions.dashboard=true inkl. Größe`}
-                className="flex min-h-[40px] items-center gap-1.5 rounded-xl theme-surface-alt px-3 text-xs font-semibold text-slate-700 hover:opacity-85 dark:text-slate-200 whitespace-nowrap"
+                onClick={onToggleCompactCards}
+                title="Kompakte Wand-Tablet-Ansicht umschalten"
+                className={`flex min-h-[40px] items-center gap-1.5 rounded-xl px-3 text-xs font-semibold transition-colors whitespace-nowrap ${
+                  compactCards
+                    ? 'theme-tonal border border-[var(--accent-ring)]'
+                    : 'theme-surface-alt text-slate-700 hover:opacity-85 dark:text-slate-200'
+                }`}
               >
-                <Sparkles className="h-3.5 w-3.5 theme-text" />
-                <span className="hidden sm:inline">appOptions</span>
+                <Rows3 className="h-3.5 w-3.5" />
+                <span>Kompakt</span>
               </button>
-            )}
 
-            <button
-              type="button"
-              onClick={() => setPickerOpen(true)}
-              className="flex min-h-[40px] items-center gap-1.5 rounded-xl theme-tonal px-3 text-xs font-semibold hover:opacity-90 transition-opacity whitespace-nowrap"
-            >
-              <Plus className="h-4 w-4" />
-              Hinzufügen
-            </button>
-            <button
-              type="button"
-              onClick={() => setEditMode((v) => !v)}
-              className={`flex min-h-[40px] items-center gap-1.5 rounded-xl px-3 text-xs font-semibold transition-colors whitespace-nowrap ${
-                editMode
-                  ? 'theme-btn-primary'
-                  : 'theme-surface-alt text-slate-700 hover:opacity-85 dark:text-slate-200'
-              }`}
-            >
-              {editMode ? <Check className="h-4 w-4" /> : <SlidersHorizontal className="h-4 w-4" />}
-              {editMode ? 'Fertig' : 'Anpassen'}
-            </button>
+              {/* fhemApp appOptions Sync Button */}
+              {appOptionsDashboardCount > 0 && (
+                <button
+                  type="button"
+                  onClick={onSyncFromAppOptions}
+                  title={`Übernimmt ${appOptionsDashboardCount} FHEM-Geräte mit appOptions.dashboard=true inkl. Größe`}
+                  className="flex min-h-[40px] items-center gap-1.5 rounded-xl theme-surface-alt px-3 text-xs font-semibold text-slate-700 hover:opacity-85 dark:text-slate-200 whitespace-nowrap"
+                >
+                  <Sparkles className="h-3.5 w-3.5 theme-text" />
+                  <span>appOptions</span>
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={() => setPickerOpen(true)}
+                className="flex min-h-[40px] items-center gap-1.5 rounded-xl theme-tonal px-3 text-xs font-semibold hover:opacity-90 transition-opacity whitespace-nowrap"
+              >
+                <Plus className="h-4 w-4" />
+                Hinzufügen
+              </button>
+              <button
+                type="button"
+                onClick={() => setEditMode((v) => !v)}
+                className={`flex min-h-[40px] items-center gap-1.5 rounded-xl px-3 text-xs font-semibold transition-colors whitespace-nowrap ${
+                  editMode
+                    ? 'theme-btn-primary'
+                    : 'theme-surface-alt text-slate-700 hover:opacity-85 dark:text-slate-200'
+                }`}
+              >
+                {editMode ? <Check className="h-4 w-4" /> : <SlidersHorizontal className="h-4 w-4" />}
+                {editMode ? 'Fertig' : 'Anpassen'}
+              </button>
+            </div>
           </div>
-        </div>
+        )}
 
         {favoriteDevices.length === 0 ? (
           <div className="rounded-2xl border border-dashed theme-surface p-8 text-center">
@@ -676,9 +912,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
         ) : dashboardGrouping === 'rooms' && !editMode ? (
           /* EasyTiley Room-Box Grouping Layout */
-          <div className="space-y-4">
+          <div className="space-y-3.5">
             {favoritesByRoom.map(([room, roomDevs]) => (
-              <div key={room} className="rounded-3xl border theme-surface p-3.5 sm:p-4 space-y-3">
+              <div key={room} className="rounded-3xl border theme-surface p-3.5 sm:p-4 space-y-2.5">
                 <div className="flex items-center justify-between px-1">
                   <button
                     type="button"
@@ -699,9 +935,13 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   </button>
                 </div>
                 <div
-                  className={`grid grid-cols-1 sm:grid-cols-2 ${
-                    compactCards ? 'lg:grid-cols-3 xl:grid-cols-4 gap-2.5' : 'xl:grid-cols-3 gap-3'
-                  }`}
+                  className={
+                    isMobileView
+                      ? 'grid grid-cols-1 gap-2.5'
+                      : `grid grid-cols-1 sm:grid-cols-2 ${
+                          compactCards ? 'lg:grid-cols-3 xl:grid-cols-4 gap-2.5' : 'xl:grid-cols-3 gap-3'
+                        }`
+                  }
                 >
                   {roomDevs.map((dev) => (
                     <DeviceControlCard
@@ -709,7 +949,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                       device={dev}
                       isFavorite
                       compact={compactCards}
-                      tileSize={resolveTileSize(dev)}
+                      tileSize={isMobileView ? 'sm' : resolveTileSize(dev)}
                       showZigbeeMetrics={showZigbeeMetrics}
                       deviceImage={showVisuals ? resolveDeviceImage(dev, customMedia).src : null}
                       onOpenDetail={onOpenDetail}
@@ -724,9 +964,13 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         ) : (
           /* Standard & Editable Drag-and-Drop Tile Grid */
           <div
-            className={`grid grid-cols-1 sm:grid-cols-2 ${
-              compactCards ? 'lg:grid-cols-3 xl:grid-cols-4 gap-2.5' : 'xl:grid-cols-3 gap-3'
-            }`}
+            className={
+              isMobileView
+                ? 'grid grid-cols-1 gap-2.5'
+                : `grid grid-cols-1 sm:grid-cols-2 ${
+                    compactCards ? 'lg:grid-cols-3 xl:grid-cols-4 gap-2.5' : 'xl:grid-cols-3 gap-3'
+                  }`
+            }
           >
             {favoriteDevices.map((dev, index) => (
               <DeviceControlCard
@@ -735,7 +979,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 isFavorite
                 editMode={editMode}
                 compact={compactCards}
-                tileSize={resolveTileSize(dev)}
+                tileSize={isMobileView ? 'sm' : resolveTileSize(dev)}
                 canMoveUp={index > 0}
                 canMoveDown={index < favoriteDevices.length - 1}
                 showZigbeeMetrics={showZigbeeMetrics}

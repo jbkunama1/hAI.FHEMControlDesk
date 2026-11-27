@@ -36,6 +36,7 @@ export const DEFAULT_CONNECTION_CONFIG: FhemConnectionConfig = {
   timeoutMs: 8000,
   pollIntervalSec: 15,
   longpollEnabled: true,
+  useServerUpstream: false,
 };
 
 const LEGACY_DUMMY_CSRF = 'csrf_8472910482';
@@ -81,6 +82,7 @@ export const DEFAULT_PREFERENCES: AppPreferences = {
   showVisuals: true,
   tileSizes: {},
   dashboardGrouping: 'grid',
+  viewMode: 'auto',
 };
 
 export const DEFAULT_CUSTOM_MEDIA: CustomMediaStore = {

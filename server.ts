@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
 import http from 'node:http';
 import https from 'node:https';
@@ -6,6 +7,7 @@ import net from 'node:net';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import express from 'express';
+import {UserProfileStore} from './server/userStore.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -22,28 +24,9 @@ function readCliArg(name: string): string | undefined {
 const PORT = Number(readCliArg('--port') || process.env.PORT) || 3000;
 const HOST = readCliArg('--host') || process.env.HOST || '0.0.0.0';
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024; // 8 MB for large jsonlist2 payloads (200+ devices)
-const STARTED_AT = Date.now();
-
-// ---------------------------------------------------------------------------
-// Structured logging (JSON lines, secrets are never logged)
-// ---------------------------------------------------------------------------
-const LOG_LEVELS = {debug: 10, info: 20, warn: 30, error: 40} as const;
-type LogLevel = keyof typeof LOG_LEVELS;
-const ACTIVE_LOG_LEVEL = LOG_LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase() as LogLevel] ?? LOG_LEVELS.info;
-const SENSITIVE_KEY = /pass|token|key|secret|authorization|cookie|cmd|header/i;
-
-function log(level: LogLevel, msg: string, fields: Record<string, unknown> = {}): void {
-  if (LOG_LEVELS[level] < ACTIVE_LOG_LEVEL) return;
-  const safe: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(fields)) {
-    safe[k] = SENSITIVE_KEY.test(k) ? '[redacted]' : v;
-  }
-  const line = JSON.stringify({ts: new Date().toISOString(), level, msg, ...safe});
-  if (level === 'error') console.error(line);
-  else console.log(line);
-}
 
 interface FhemExecuteBody {
+  useServerUpstream?: boolean;
   protocol?: string;
   host?: string;
   port?: number;
@@ -64,6 +47,24 @@ interface FhemExecuteBody {
   timeoutMs?: number;
 }
 
+interface ManagedFhemUpstream {
+  enabled: true;
+  exclusive: boolean;
+  protocol: 'http' | 'https';
+  host: string;
+  port: number;
+  basePath: string;
+  httpMethod: 'GET' | 'POST';
+  csrfMode: 'none' | 'auto' | 'manual';
+  manualCsrfToken: string;
+  authType: 'none' | 'basic' | 'apikey' | 'custom_header' | 'query_token';
+  acceptSelfSigned: boolean;
+  hasCredentials: boolean;
+  displayTarget: string;
+  queryTokenPair: [string, string] | null;
+  headers: Record<string, string>;
+}
+
 const BLOCKED_CUSTOM_HEADERS = new Set([
   'host',
   'content-length',
@@ -76,6 +77,158 @@ const BLOCKED_CUSTOM_HEADERS = new Set([
   'proxy-connection',
   'proxy-authorization',
 ]);
+
+function loadManagedFhemUpstream(): ManagedFhemUpstream | null {
+  const rawUrl = (process.env.FHEM_UPSTREAM_URL || '').trim();
+  if (!rawUrl) return null;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    console.warn('FHEM Control Desk: FHEM_UPSTREAM_URL ist ungültig und wird ignoriert.');
+    return null;
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    console.warn('FHEM Control Desk: FHEM_UPSTREAM_URL muss http:// oder https:// verwenden.');
+    return null;
+  }
+
+  const host = parsed.hostname.trim().toLowerCase();
+  const bareHost = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+  // Always block cloud metadata & link-local even for env-configured upstreams
+  if (
+    !bareHost ||
+    bareHost === '0.0.0.0' ||
+    bareHost === '::' ||
+    bareHost === 'metadata.google.internal' ||
+    bareHost === 'metadata' ||
+    bareHost === '169.254.169.254' ||
+    bareHost.startsWith('169.254.') ||
+    bareHost.startsWith('fe80:') ||
+    bareHost.startsWith('fe9') ||
+    bareHost.startsWith('fea') ||
+    bareHost.startsWith('feb')
+  ) {
+    console.warn('FHEM Control Desk: FHEM_UPSTREAM_URL zeigt auf eine blockierte Link-Local/Metadaten-Adresse.');
+    return null;
+  }
+
+  const protocol: 'http' | 'https' = parsed.protocol === 'https:' ? 'https' : 'http';
+  const port = parsed.port ? Number(parsed.port) : protocol === 'https' ? 443 : 80;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    console.warn('FHEM Control Desk: FHEM_UPSTREAM_URL enthält einen ungültigen Port.');
+    return null;
+  }
+
+  const cleanPath =
+    parsed.pathname && parsed.pathname !== '/'
+      ? parsed.pathname.replace(/\/+$/, '')
+      : '/fhem';
+  const basePath = /^\/[a-zA-Z0-9._/-]*$/.test(cleanPath) ? cleanPath : '/fhem';
+
+  const exclusiveRaw = (process.env.FHEM_EXCLUSIVE_MODE || 'true').trim().toLowerCase();
+  const exclusive = exclusiveRaw !== 'false';
+
+  const httpMethod: 'GET' | 'POST' =
+    (process.env.FHEM_UPSTREAM_METHOD || 'GET').trim().toUpperCase() === 'POST' ? 'POST' : 'GET';
+
+  const csrfModeRaw = (process.env.FHEM_UPSTREAM_CSRF_MODE || 'auto').trim().toLowerCase();
+  const csrfMode: 'none' | 'auto' | 'manual' =
+    csrfModeRaw === 'none' ? 'none' : csrfModeRaw === 'manual' ? 'manual' : 'auto';
+  const manualCsrfToken =
+    csrfMode === 'manual' ? (process.env.FHEM_UPSTREAM_CSRF_TOKEN || '').trim() : '';
+
+  const acceptSelfSigned =
+    protocol === 'https' &&
+    (process.env.FHEM_UPSTREAM_ACCEPT_SELF_SIGNED || '').trim().toLowerCase() === 'true';
+
+  const envUser = (process.env.FHEM_UPSTREAM_USER || '').trim();
+  const envPass = process.env.FHEM_UPSTREAM_PASS || '';
+  const envApiKey = (process.env.FHEM_UPSTREAM_API_KEY || '').trim();
+  const envHeaderName = (process.env.FHEM_UPSTREAM_HEADER_NAME || '').trim();
+  const envHeaderVal = (process.env.FHEM_UPSTREAM_HEADER_VALUE || '').trim();
+  const envQueryParam = (process.env.FHEM_UPSTREAM_QUERY_PARAM || '').trim();
+  const envQueryVal = (process.env.FHEM_UPSTREAM_QUERY_VALUE || '').trim();
+
+  const rawAuthType = (process.env.FHEM_UPSTREAM_AUTH_TYPE || '').trim().toLowerCase();
+  let authType: 'none' | 'basic' | 'apikey' | 'custom_header' | 'query_token' = 'none';
+  if (
+    rawAuthType === 'none' ||
+    rawAuthType === 'basic' ||
+    rawAuthType === 'apikey' ||
+    rawAuthType === 'custom_header' ||
+    rawAuthType === 'query_token'
+  ) {
+    authType = rawAuthType;
+  } else if (envUser) {
+    authType = 'basic';
+  } else if (envApiKey) {
+    authType = 'apikey';
+  } else if (envHeaderName && envHeaderVal) {
+    authType = 'custom_header';
+  } else if (envQueryParam && envQueryVal) {
+    authType = 'query_token';
+  }
+
+  const headers: Record<string, string> = {
+    Accept: 'application/json, text/plain, */*',
+    'User-Agent': 'FHEM-Control-Desk/1.0',
+  };
+  let queryTokenPair: [string, string] | null = null;
+  let hasCredentials = false;
+
+  if (authType === 'basic' && envUser) {
+    const encoded = Buffer.from(`${envUser}:${envPass}`, 'utf8').toString('base64');
+    headers.Authorization = `Basic ${encoded}`;
+    hasCredentials = true;
+  } else if (authType === 'apikey' && envApiKey && !/[\r\n]/.test(envApiKey)) {
+    headers.Authorization = `Bearer ${envApiKey}`;
+    hasCredentials = true;
+  } else if (
+    authType === 'custom_header' &&
+    envHeaderName &&
+    envHeaderVal &&
+    /^[A-Za-z0-9-]{1,64}$/.test(envHeaderName) &&
+    !BLOCKED_CUSTOM_HEADERS.has(envHeaderName.toLowerCase()) &&
+    !/[\r\n]/.test(envHeaderVal)
+  ) {
+    headers[envHeaderName] = envHeaderVal;
+    hasCredentials = true;
+  } else if (
+    authType === 'query_token' &&
+    envQueryParam &&
+    envQueryVal &&
+    /^[A-Za-z0-9_.-]{1,64}$/.test(envQueryParam)
+  ) {
+    queryTokenPair = [envQueryParam, envQueryVal];
+    hasCredentials = true;
+  }
+
+  const portPart =
+    (protocol === 'http' && port === 80) || (protocol === 'https' && port === 443) ? '' : `:${port}`;
+  const formattedHost = bareHost.includes(':') ? `[${bareHost}]` : bareHost;
+  const displayTarget = `${protocol}://${formattedHost}${portPart}${basePath}`;
+
+  return {
+    enabled: true,
+    exclusive,
+    protocol,
+    host: bareHost,
+    port,
+    basePath,
+    httpMethod,
+    csrfMode,
+    manualCsrfToken,
+    authType,
+    acceptSelfSigned,
+    hasCredentials,
+    displayTarget,
+    queryTokenPair,
+    headers,
+  };
+}
 
 function getAllowedHosts(extraEnvKey?: string): Set<string> {
   const parts = [process.env.FHEM_ALLOWED_HOSTS || ''];
@@ -91,68 +244,57 @@ function getAllowedHosts(extraEnvKey?: string): Set<string> {
   );
 }
 
-type IpClass = 'always_blocked' | 'private_lan' | 'public';
-
-function classifyIpv4(ip: string): IpClass {
-  const p = ip.split('.').map(Number);
-  if (p.length !== 4 || p.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
-    return 'always_blocked';
+function isIpv4InRange(ip: string, prefixA: number, prefixBStart?: number, prefixBEnd?: number): boolean {
+  const parts = ip.split('.').map(Number);
+  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) {
+    return false;
   }
-  const [a, b] = p;
-  // Loopback, unspecified/"this network", link-local (cloud metadata), multicast/reserved
-  if (a === 127 || a === 0 || (a === 169 && b === 254) || a >= 224) {
-    return 'always_blocked';
+  if (parts[0] !== prefixA) return false;
+  if (prefixBStart !== undefined && prefixBEnd !== undefined) {
+    return parts[1] >= prefixBStart && parts[1] <= prefixBEnd;
   }
-  // RFC1918 private LAN and CGNAT (100.64.0.0/10, e.g. Tailscale) need an explicit allow-list entry
-  if (a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127)) {
-    return 'private_lan';
-  }
-  return 'public';
+  return true;
 }
 
-function expandIpv6(ip: string): number[] | null {
-  let addr = ip.split('%')[0];
-  const dotted = addr.match(/(\d{1,3}(?:\.\d{1,3}){3})$/);
-  if (dotted) {
-    const q = dotted[1].split('.').map(Number);
-    if (q.some((n) => n > 255)) return null;
-    addr = `${addr.slice(0, -dotted[1].length)}${((q[0] << 8) | q[1]).toString(16)}:${((q[2] << 8) | q[3]).toString(16)}`;
-  }
-  const halves = addr.split('::');
-  if (halves.length > 2) return null;
-  const head = halves[0] ? halves[0].split(':') : [];
-  const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
-  const missing = 8 - head.length - tail.length;
-  if (halves.length === 1 ? missing !== 0 : missing < 1) return null;
-  const groups = [...head, ...Array(halves.length === 2 ? missing : 0).fill('0'), ...tail].map((g) => parseInt(g, 16));
-  return groups.length === 8 && groups.every((n) => Number.isInteger(n) && n >= 0 && n <= 0xffff) ? groups : null;
-}
+function classifyIpAddress(ip: string): 'always_blocked' | 'private_lan' | 'public' {
+  const normalized = ip.toLowerCase().trim();
+  const mappedV4 = normalized.startsWith('::ffff:') ? normalized.slice(7) : normalized;
 
-function classifyIpAddress(ip: string): IpClass {
-  const normalized = ip.toLowerCase().trim().split('%')[0];
-
-  if (net.isIPv4(normalized)) {
-    return classifyIpv4(normalized);
+  if (net.isIPv4(mappedV4)) {
+    // Always block loopback, link-local / cloud metadata, unspecified, CGNAT
+    if (
+      isIpv4InRange(mappedV4, 127) ||
+      isIpv4InRange(mappedV4, 0) ||
+      isIpv4InRange(mappedV4, 169, 254, 254)
+    ) {
+      return 'always_blocked';
+    }
+    // RFC1918 private LAN & CGNAT addresses
+    if (
+      isIpv4InRange(mappedV4, 10) ||
+      isIpv4InRange(mappedV4, 172, 16, 31) ||
+      isIpv4InRange(mappedV4, 192, 168, 168) ||
+      isIpv4InRange(mappedV4, 100, 64, 127)
+    ) {
+      return 'private_lan';
+    }
+    return 'public';
   }
 
   if (net.isIPv6(normalized)) {
-    const g = expandIpv6(normalized);
-    if (!g) return 'always_blocked';
-    const embeddedV4 = `${g[6] >> 8}.${g[6] & 255}.${g[7] >> 8}.${g[7] & 255}`;
-    const upperZero = g.slice(0, 5).every((n) => n === 0);
-
-    // ::/96 (unspecified, loopback, deprecated IPv4-compatible) -> never allowed
-    if (upperZero && g[5] === 0) return 'always_blocked';
-    // ::ffff:0:0/96 IPv4-mapped (dotted or hex notation)
-    if (upperZero && g[5] === 0xffff) return classifyIpv4(embeddedV4);
-    // 64:ff9b::/96 NAT64
-    if (g[0] === 0x64 && g[1] === 0xff9b && g.slice(2, 6).every((n) => n === 0)) return classifyIpv4(embeddedV4);
-    // fe80::/10 link-local, fec0::/10 site-local, ff00::/8 multicast
-    if ((g[0] & 0xffc0) === 0xfe80 || (g[0] & 0xffc0) === 0xfec0 || (g[0] & 0xff00) === 0xff00) {
+    if (
+      normalized === '::1' ||
+      normalized === '::' ||
+      normalized.startsWith('fe80:') ||
+      normalized.startsWith('fe9') ||
+      normalized.startsWith('fea') ||
+      normalized.startsWith('feb')
+    ) {
       return 'always_blocked';
     }
-    // fc00::/7 unique local
-    if ((g[0] & 0xfe00) === 0xfc00) return 'private_lan';
+    if (normalized.startsWith('fc') || normalized.startsWith('fd')) {
+      return 'private_lan';
+    }
     return 'public';
   }
 
@@ -162,7 +304,7 @@ function classifyIpAddress(ip: string): IpClass {
 async function validateTargetHost(
   host: string,
   extraEnvKey?: string
-): Promise<{ok: true; resolvedIp: string} | {ok: false; code: string; message: string}> {
+): Promise<{ok: true; resolvedIp?: string} | {ok: false; code: string; message: string}> {
   const cleanHost = host.trim().toLowerCase();
   if (!cleanHost || cleanHost.length > 253 || /[\s/@?#\\]/.test(cleanHost)) {
     return {
@@ -247,18 +389,6 @@ async function validateTargetHost(
   }
 }
 
-// Forces the socket to connect to the IP that passed validation (prevents DNS rebinding / TOCTOU).
-function pinnedLookup(ip: string): net.LookupFunction {
-  const family = net.isIPv6(ip) ? 6 : 4;
-  return (_hostname, options, callback) => {
-    if (options.all) {
-      callback(null, [{address: ip, family}]);
-    } else {
-      callback(null, ip, family);
-    }
-  };
-}
-
 function executeFhemHttpRequest(options: {
   protocol: 'http' | 'https';
   host: string;
@@ -266,11 +396,9 @@ function executeFhemHttpRequest(options: {
   method: 'GET' | 'POST';
   pathWithQuery: string;
   bodyPayload?: string;
-  contentType?: string;
   headers: Record<string, string>;
   acceptSelfSigned: boolean;
   timeoutMs: number;
-  pinnedIp: string;
 }): Promise<{
   statusCode: number;
   body: string;
@@ -287,7 +415,7 @@ function executeFhemHttpRequest(options: {
     let payloadBuf: Buffer | undefined;
     if (options.method === 'POST' && options.bodyPayload !== undefined) {
       payloadBuf = Buffer.from(options.bodyPayload, 'utf8');
-      reqHeaders['Content-Type'] = options.contentType || 'application/x-www-form-urlencoded';
+      reqHeaders['Content-Type'] = 'application/x-www-form-urlencoded';
       reqHeaders['Content-Length'] = String(payloadBuf.byteLength);
     }
 
@@ -299,7 +427,6 @@ function executeFhemHttpRequest(options: {
       method: options.method,
       headers: reqHeaders,
       timeout: options.timeoutMs,
-      lookup: pinnedLookup(options.pinnedIp),
       ...(isHttps
         ? {
             rejectUnauthorized: !options.acceptSelfSigned,
@@ -356,24 +483,6 @@ function executeFhemHttpRequest(options: {
   });
 }
 
-function tcpPing(host: string, port: number, timeoutMs: number): Promise<{ok: boolean; latencyMs: number}> {
-  return new Promise((resolve) => {
-    const startedAt = Date.now();
-    const socket = net.connect({host, port});
-    let done = false;
-    const finish = (ok: boolean) => {
-      if (done) return;
-      done = true;
-      socket.destroy();
-      resolve({ok, latencyMs: Date.now() - startedAt});
-    };
-    socket.setTimeout(timeoutMs);
-    socket.once('connect', () => finish(true));
-    socket.once('timeout', () => finish(false));
-    socket.once('error', () => finish(false));
-  });
-}
-
 const MAX_LONGPOLL_LINE_BYTES = 256 * 1024; // 256 KB safety cap per buffered line
 const MAX_LONGPOLL_DURATION_MS = 10 * 60 * 1000; // 10 min max lifetime before clean reconnect
 const LONGPOLL_HEARTBEAT_MS = 20_000;
@@ -381,7 +490,6 @@ const LONGPOLL_HEARTBEAT_MS = 20_000;
 interface ValidatedFhemConnection {
   protocol: 'http' | 'https';
   host: string;
-  resolvedIp: string;
   port: number;
   basePath: string;
   httpMethod: 'GET' | 'POST';
@@ -511,7 +619,6 @@ async function parseAndValidateFhemConnection(
     conn: {
       protocol,
       host,
-      resolvedIp: hostCheck.resolvedIp,
       port,
       basePath,
       httpMethod,
@@ -536,77 +643,572 @@ function isValidFhemCsrfToken(token: string): boolean {
   );
 }
 
-async function createApp() {
-  const app = express();
-  app.disable('x-powered-by');
-  app.use(express.json({limit: '1mb'}));
+function sha256Digest(input: string): Buffer {
+  return crypto.createHash('sha256').update(input, 'utf8').digest();
+}
 
-  // Request logging for /api/* (method, path, status, duration, errorCode only - never bodies/queries)
-  app.use((req, res, next) => {
-    if (!req.path.startsWith('/api/') || req.path === '/api/health') {
-      next();
-      return;
-    }
-    const startedAt = Date.now();
-    const origJson = res.json.bind(res);
-    res.json = ((payload: unknown) => {
-      const p = payload as {ok?: boolean; errorCode?: string} | null;
-      if (p && typeof p === 'object' && p.ok === false && p.errorCode) {
-        res.locals.errorCode = p.errorCode;
-      }
-      return origJson(payload);
-    }) as typeof res.json;
-    res.on('finish', () => {
-      const errorCode = res.locals.errorCode as string | undefined;
-      log(errorCode ? 'warn' : 'info', 'http_request', {
-        method: req.method,
-        path: req.path,
-        status: res.statusCode,
-        ms: Date.now() - startedAt,
-        errorCode,
-      });
-    });
-    next();
-  });
+function createAppBasicAuthMiddleware(): express.RequestHandler | null {
+  // Browser-native HTTP Basic Auth popups are blocked inside cross-origin preview iframes.
+  // Enable Basic Auth automatically in production (Docker / self-hosted) or when explicitly forced.
+  const isProduction = process.env.NODE_ENV === 'production';
+  const forceBasicAuth = (process.env.FORCE_BASIC_AUTH || '').trim().toLowerCase() === 'true';
+  if (!isProduction && !forceBasicAuth) {
+    return null;
+  }
 
-  // Liveness by default (used by Docker HEALTHCHECK). ?deep=1 additionally pings FHEM via TCP
-  // when FHEM_HEALTH_HOST (and optionally FHEM_HEALTH_PORT, default 8083) is configured.
-  app.get('/api/health', async (req, res) => {
-    const payload: Record<string, unknown> = {
-      status: 'ok',
-      timestamp: new Date().toISOString(),
-      uptimeSec: Math.round((Date.now() - STARTED_AT) / 1000),
+  const authUser = (process.env.APP_AUTH_USER || '').trim();
+  const authPass = process.env.APP_AUTH_PASS || '';
+
+  if (!authUser && !authPass) {
+    return null;
+  }
+
+  // Fail closed if only one of user/pass was configured
+  if (!authUser || !authPass) {
+    console.warn(
+      'FHEM Control Desk: APP_AUTH_USER oder APP_AUTH_PASS fehlt. Zugriff wird aus Sicherheitsgründen blockiert, bis beide gesetzt sind.'
+    );
+    return (_req, res) => {
+      res.setHeader('Cache-Control', 'no-store');
+      res.status(503).send('App-Authentifizierung unvollständig konfiguriert.');
     };
-    const deep = String(req.query.deep || '').toLowerCase();
-    if (deep === '1' || deep === 'true') {
-      const fhemHost = (process.env.FHEM_HEALTH_HOST || '').trim();
-      if (!fhemHost) {
-        payload.fhem = {configured: false};
-      } else {
-        const fhemPort = Number(process.env.FHEM_HEALTH_PORT) || 8083;
-        const result = await tcpPing(fhemHost, fhemPort, 2000);
-        payload.fhem = {configured: true, ok: result.ok, latencyMs: result.latencyMs};
-        if (!result.ok) {
-          payload.status = 'degraded';
-          log('warn', 'health_fhem_unreachable', {port: fhemPort});
+  }
+
+  const expectedUserHash = sha256Digest(authUser);
+  const expectedPassHash = sha256Digest(authPass);
+
+  return (req, res, next) => {
+    const authHeader = req.get('authorization') || '';
+    if (authHeader.length > 0 && authHeader.length <= 4096) {
+      const match = authHeader.match(/^Basic\s+([A-Za-z0-9+/=]+)$/i);
+      if (match) {
+        const decoded = Buffer.from(match[1], 'base64').toString('utf8');
+        const colonIdx = decoded.indexOf(':');
+        if (colonIdx !== -1) {
+          const suppliedUser = decoded.slice(0, colonIdx);
+          const suppliedPass = decoded.slice(colonIdx + 1);
+          const userOk = crypto.timingSafeEqual(sha256Digest(suppliedUser), expectedUserHash);
+          const passOk = crypto.timingSafeEqual(sha256Digest(suppliedPass), expectedPassHash);
+          if (userOk && passOk) {
+            next();
+            return;
+          }
         }
       }
     }
-    res.json(payload);
+
+    res.setHeader('WWW-Authenticate', 'Basic realm="FHEM Control Desk", charset="UTF-8"');
+    res.setHeader('Cache-Control', 'no-store');
+    if (req.path.startsWith('/api/')) {
+      res.status(401).json({
+        ok: false,
+        errorCode: 'APP_AUTH_REQUIRED',
+        message: 'Anmeldung erforderlich (HTTP Basic Auth).',
+      });
+      return;
+    }
+    res.status(401).send('Anmeldung erforderlich (HTTP Basic Auth).');
+  };
+}
+
+async function createApp() {
+  const app = express();
+  app.disable('x-powered-by');
+  // Support 1 reverse-proxy hop (Caddy / Nginx Proxy Manager) so req.ip reflects the real client IP for rate limiting
+  app.set('trust proxy', 1);
+
+  // Baseline security headers for internet-facing deployments
+  app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    if (req.secure || req.get('x-forwarded-proto') === 'https') {
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
+    next();
   });
 
-  app.post('/api/fhem/execute', async (req, res) => {
+  const jsonParserStandard = express.json({limit: '1mb'});
+  const jsonParserProfile = express.json({limit: '6mb'});
+  app.use((req, res, next) => {
+    if (req.path === '/api/profile') {
+      jsonParserProfile(req, res, next);
+      return;
+    }
+    jsonParserStandard(req, res, next);
+  });
+
+  // Unauthenticated lightweight liveness endpoint for Docker HEALTHCHECK
+  app.get('/api/health', (_req, res) => {
+    res.json({status: 'ok', timestamp: new Date().toISOString()});
+  });
+
+  // Optional App-Level HTTP Basic Auth (protects UI, static assets, and all /api/* routes)
+  const basicAuthMiddleware = createAppBasicAuthMiddleware();
+  if (basicAuthMiddleware) {
+    app.use(basicAuthMiddleware);
+  }
+
+  // Internet-facing login gate (enabled by default; set REQUIRE_LOGIN=false only on isolated LANs)
+  const requireLogin = (process.env.REQUIRE_LOGIN || 'true').trim().toLowerCase() !== 'false';
+  const adminBootstrapToken = (process.env.ADMIN_BOOTSTRAP_TOKEN || '').trim();
+  const managedFhem = loadManagedFhemUpstream();
+  if (managedFhem) {
+    console.log(
+      `FHEM Control Desk: Server-Managed Stack-Modus aktiv (${managedFhem.exclusive ? 'exklusiv' : 'optional'}) -> ${managedFhem.displayTarget}`
+    );
+  }
+  const bootstrapAttempts = new Map<string, {count: number; resetAt: number}>();
+
+  // Server-side Multi-User & Cross-Device Profile Sync Store
+  const dataDir = process.env.DATA_DIR
+    ? path.resolve(process.env.DATA_DIR)
+    : path.resolve(__dirname, 'data');
+  const userStore = new UserProfileStore(dataDir);
+
+  const SESSION_COOKIE_NAME = 'fhem_desk_session';
+  const REMEMBER_ME_MAX_AGE_SEC = 30 * 24 * 60 * 60; // 30 days
+
+  const isHttpsRequest = (req: express.Request): boolean =>
+    req.secure || (req.get('x-forwarded-proto') || '').split(',')[0].trim().toLowerCase() === 'https';
+
+  const readSessionCookie = (req: express.Request): string | null => {
+    const rawCookie = req.get('cookie');
+    if (!rawCookie) return null;
+    for (const part of rawCookie.split(';')) {
+      const eq = part.indexOf('=');
+      if (eq === -1) continue;
+      const name = part.slice(0, eq).trim();
+      if (name !== SESSION_COOKIE_NAME) continue;
+      const value = part.slice(eq + 1).trim();
+      if (/^[A-Za-z0-9_-]{20,256}$/.test(value)) {
+        return value;
+      }
+    }
+    return null;
+  };
+
+  const setSessionCookie = (
+    req: express.Request,
+    res: express.Response,
+    rawToken: string,
+    rememberMe: boolean
+  ): void => {
+    const parts = [`${SESSION_COOKIE_NAME}=${rawToken}`, 'Path=/', 'HttpOnly'];
+    if (rememberMe) {
+      parts.push(`Max-Age=${REMEMBER_ME_MAX_AGE_SEC}`);
+    }
+    if (isHttpsRequest(req)) {
+      parts.push('Secure', 'SameSite=None', 'Partitioned');
+    } else {
+      parts.push('SameSite=Lax');
+    }
+    res.setHeader('Set-Cookie', parts.join('; '));
+  };
+
+  const clearSessionCookie = (req: express.Request, res: express.Response): void => {
+    const parts = [`${SESSION_COOKIE_NAME}=`, 'Path=/', 'HttpOnly', 'Max-Age=0'];
+    if (isHttpsRequest(req)) {
+      parts.push('Secure', 'SameSite=None', 'Partitioned');
+    } else {
+      parts.push('SameSite=Lax');
+    }
+    res.setHeader('Set-Cookie', parts.join('; '));
+  };
+
+  const extractSessionToken = (req: express.Request): string | null => {
+    const custom = req.get('X-Session-Token');
+    if (custom && custom.trim()) return custom.trim();
+    const auth = req.get('authorization') || '';
+    const m = auth.match(/^Bearer\s+([A-Za-z0-9_-]{20,256})$/i);
+    if (m) return m[1];
+    return readSessionCookie(req);
+  };
+
+  const requireAppHeader = (req: express.Request, res: express.Response): boolean => {
     if (req.get('X-Requested-With') !== 'FHEM-Control-Desk') {
       res.status(403).json({
         ok: false,
         errorCode: 'CSRF_HEADER_MISSING',
         message: 'Ungültige Anfrage-Herkunft (Header fehlt).',
       });
-      return;
+      return false;
+    }
+    // Verify Origin header matches Host/X-Forwarded-Host when sent by browsers (CSRF protection for cookie sessions)
+    const origin = req.get('origin');
+    if (origin) {
+      const expectedHost = (req.get('x-forwarded-host') || req.get('host') || '')
+        .split(',')[0]
+        .trim()
+        .toLowerCase();
+      try {
+        const originHost = new URL(origin).host.toLowerCase();
+        if (expectedHost && originHost !== expectedHost) {
+          res.status(403).json({
+            ok: false,
+            errorCode: 'ORIGIN_MISMATCH',
+            message: 'Ungültige Anfrage-Herkunft (Origin stimmt nicht überein).',
+          });
+          return false;
+        }
+      } catch {
+        res.status(403).json({
+          ok: false,
+          errorCode: 'INVALID_ORIGIN',
+          message: 'Ungültiger Origin-Header.',
+        });
+        return false;
+      }
+    }
+    return true;
+  };
+
+  const requireAuthenticatedIfEnabled = async (
+    req: express.Request,
+    res: express.Response
+  ): Promise<boolean> => {
+    if (!requireLogin) return true;
+    const auth = await userStore.getSessionFromToken(extractSessionToken(req));
+    if (!auth) {
+      res.status(401).json({
+        ok: false,
+        errorCode: 'UNAUTHORIZED',
+        message: 'Anmeldung erforderlich. Bitte melde dich zuerst mit deinem Benutzerprofil an.',
+      });
+      return false;
+    }
+    return true;
+  };
+
+  app.get('/api/auth/status', async (req, res) => {
+    try {
+      const cookieToken = readSessionCookie(req);
+      const token = extractSessionToken(req);
+      const status = await userStore.getStatus(token);
+      if (cookieToken && !status.authenticated) {
+        clearSessionCookie(req, res);
+      }
+      res.setHeader('Cache-Control', 'no-store');
+      const canSeeManagedTarget = status.authenticated || !requireLogin;
+      res.json({
+        ok: true,
+        initialized: status.initialized,
+        userCount: status.authenticated ? status.userCount : 0,
+        authenticated: status.authenticated,
+        user: status.user,
+        requireLogin,
+        bootstrapTokenRequired: Boolean(adminBootstrapToken),
+        managedFhem: managedFhem
+          ? canSeeManagedTarget
+            ? {
+                enabled: true,
+                exclusive: managedFhem.exclusive,
+                displayTarget: managedFhem.displayTarget,
+                protocol: managedFhem.protocol,
+                host: managedFhem.host,
+                port: managedFhem.port,
+                basePath: managedFhem.basePath,
+                httpMethod: managedFhem.httpMethod,
+                csrfMode: managedFhem.csrfMode,
+                authType: managedFhem.authType,
+                hasCredentials: managedFhem.hasCredentials,
+              }
+            : {
+                enabled: true,
+                exclusive: managedFhem.exclusive,
+              }
+          : {
+              enabled: false,
+              exclusive: false,
+            },
+      });
+    } catch {
+      res.status(500).json({ok: false, errorCode: 'STORE_ERROR', message: 'Status konnte nicht geladen werden.'});
+    }
+  });
+
+  app.post('/api/auth/bootstrap', async (req, res) => {
+    if (!requireAppHeader(req, res)) return;
+    const body = (req.body || {}) as {
+      username?: string;
+      displayName?: string;
+      password?: string;
+      setupToken?: string;
+      rememberMe?: boolean;
+    };
+
+    if (adminBootstrapToken) {
+      const clientKey = req.ip || req.socket.remoteAddress || 'unknown';
+      const now = Date.now();
+      const attempt = bootstrapAttempts.get(clientKey);
+      if (attempt && attempt.resetAt > now && attempt.count >= 8) {
+        res.status(429).json({
+          ok: false,
+          errorCode: 'RATE_LIMITED',
+          message: 'Zu viele fehlgeschlagene Setup-Versuche. Bitte später erneut versuchen.',
+        });
+        return;
+      }
+
+      const supplied = typeof body.setupToken === 'string' ? body.setupToken.trim() : '';
+      const valid =
+        supplied.length > 0 &&
+        crypto.timingSafeEqual(sha256Digest(supplied), sha256Digest(adminBootstrapToken));
+      if (!valid) {
+        const nextCount = attempt && attempt.resetAt > now ? attempt.count + 1 : 1;
+        bootstrapAttempts.set(clientKey, {count: nextCount, resetAt: now + 5 * 60_000});
+        res.status(403).json({
+          ok: false,
+          errorCode: 'INVALID_BOOTSTRAP_TOKEN',
+          message: 'Ungültiger Einrichtungs-Code (ADMIN_BOOTSTRAP_TOKEN).',
+        });
+        return;
+      }
+      bootstrapAttempts.delete(clientKey);
     }
 
+    try {
+      const result = await userStore.bootstrapFirstAdmin({
+        username: typeof body.username === 'string' ? body.username : '',
+        displayName: typeof body.displayName === 'string' ? body.displayName : '',
+        password: typeof body.password === 'string' ? body.password : '',
+        rememberMe: body.rememberMe !== false,
+      });
+      res.setHeader('Cache-Control', 'no-store');
+      if (!result.ok) {
+        res.status(result.status).json(result);
+        return;
+      }
+      setSessionCookie(req, res, result.token, result.rememberMe);
+      res.status(201).json(result);
+    } catch {
+      res.status(500).json({ok: false, errorCode: 'STORE_ERROR', message: 'Admin-Profil konnte nicht angelegt werden.'});
+    }
+  });
+
+  app.post('/api/auth/login', async (req, res) => {
+    if (!requireAppHeader(req, res)) return;
+    const body = (req.body || {}) as {username?: string; password?: string; rememberMe?: boolean};
+    const clientKey = req.ip || req.socket.remoteAddress || 'unknown';
+    try {
+      const result = await userStore.login({
+        username: typeof body.username === 'string' ? body.username : '',
+        password: typeof body.password === 'string' ? body.password : '',
+        clientKey,
+        rememberMe: body.rememberMe !== false,
+      });
+      res.setHeader('Cache-Control', 'no-store');
+      if (!result.ok) {
+        res.status(result.status).json(result);
+        return;
+      }
+      setSessionCookie(req, res, result.token, result.rememberMe);
+      res.json(result);
+    } catch {
+      res.status(500).json({ok: false, errorCode: 'STORE_ERROR', message: 'Anmeldung fehlgeschlagen.'});
+    }
+  });
+
+  app.post('/api/auth/logout', async (req, res) => {
+    if (!requireAppHeader(req, res)) return;
+    await userStore.logoutToken(extractSessionToken(req));
+    clearSessionCookie(req, res);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ok: true});
+  });
+
+  app.post('/api/auth/change-password', async (req, res) => {
+    if (!requireAppHeader(req, res)) return;
+    const rawToken = extractSessionToken(req);
+    const auth = await userStore.getSessionFromToken(rawToken);
+    if (!auth) {
+      res.status(401).json({ok: false, errorCode: 'UNAUTHORIZED', message: 'Bitte zuerst anmelden.'});
+      return;
+    }
+    const body = (req.body || {}) as {currentPassword?: string; newPassword?: string};
+    try {
+      const result = await userStore.changeOwnPassword(
+        auth.session,
+        typeof body.currentPassword === 'string' ? body.currentPassword : '',
+        typeof body.newPassword === 'string' ? body.newPassword : '',
+        rawToken
+      );
+      res.setHeader('Cache-Control', 'no-store');
+      if (!result.ok) {
+        res.status(result.status).json(result);
+        return;
+      }
+      res.json({ok: true});
+    } catch {
+      res.status(500).json({ok: false, errorCode: 'STORE_ERROR', message: 'Passwort konnte nicht geändert werden.'});
+    }
+  });
+
+  app.get('/api/profile', async (req, res) => {
+    const auth = await userStore.getSessionFromToken(extractSessionToken(req));
+    if (!auth) {
+      res.status(401).json({ok: false, errorCode: 'UNAUTHORIZED', message: 'Bitte zuerst anmelden.'});
+      return;
+    }
+    try {
+      const data = await userStore.getProfile(auth.session);
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({ok: true, ...data});
+    } catch {
+      res.status(500).json({ok: false, errorCode: 'STORE_ERROR', message: 'Profil konnte nicht geladen werden.'});
+    }
+  });
+
+  app.put('/api/profile', async (req, res) => {
+    if (!requireAppHeader(req, res)) return;
+    const auth = await userStore.getSessionFromToken(extractSessionToken(req));
+    if (!auth) {
+      res.status(401).json({ok: false, errorCode: 'UNAUTHORIZED', message: 'Bitte zuerst anmelden.'});
+      return;
+    }
+    try {
+      const saved = await userStore.saveProfile(auth.session, req.body || {});
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({ok: true, updatedAt: saved.updatedAt});
+    } catch {
+      res.status(500).json({ok: false, errorCode: 'STORE_ERROR', message: 'Profil konnte nicht gespeichert werden.'});
+    }
+  });
+
+  app.get('/api/admin/users', async (req, res) => {
+    const auth = await userStore.getSessionFromToken(extractSessionToken(req));
+    if (!auth) {
+      res.status(401).json({ok: false, errorCode: 'UNAUTHORIZED', message: 'Bitte zuerst anmelden.'});
+      return;
+    }
+    if (auth.user.role !== 'admin') {
+      res.status(403).json({ok: false, errorCode: 'FORBIDDEN', message: 'Nur Administratoren dürfen Benutzer verwalten.'});
+      return;
+    }
+    try {
+      const users = await userStore.listUsers();
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({ok: true, users});
+    } catch {
+      res.status(500).json({ok: false, errorCode: 'STORE_ERROR', message: 'Benutzerliste konnte nicht geladen werden.'});
+    }
+  });
+
+  app.post('/api/admin/users', async (req, res) => {
+    if (!requireAppHeader(req, res)) return;
+    const auth = await userStore.getSessionFromToken(extractSessionToken(req));
+    if (!auth) {
+      res.status(401).json({ok: false, errorCode: 'UNAUTHORIZED', message: 'Bitte zuerst anmelden.'});
+      return;
+    }
+    if (auth.user.role !== 'admin') {
+      res.status(403).json({ok: false, errorCode: 'FORBIDDEN', message: 'Nur Administratoren dürfen Benutzer anlegen.'});
+      return;
+    }
+    const body = (req.body || {}) as {username?: string; displayName?: string; password?: string; role?: 'admin' | 'user'};
+    try {
+      const result = await userStore.createUser({
+        username: typeof body.username === 'string' ? body.username : '',
+        displayName: typeof body.displayName === 'string' ? body.displayName : '',
+        password: typeof body.password === 'string' ? body.password : '',
+        role: body.role === 'admin' ? 'admin' : 'user',
+      });
+      res.setHeader('Cache-Control', 'no-store');
+      if (!result.ok) {
+        res.status(result.status).json(result);
+        return;
+      }
+      res.status(201).json(result);
+    } catch {
+      res.status(500).json({ok: false, errorCode: 'STORE_ERROR', message: 'Benutzer konnte nicht angelegt werden.'});
+    }
+  });
+
+  app.patch('/api/admin/users/:id', async (req, res) => {
+    if (!requireAppHeader(req, res)) return;
+    const auth = await userStore.getSessionFromToken(extractSessionToken(req));
+    if (!auth) {
+      res.status(401).json({ok: false, errorCode: 'UNAUTHORIZED', message: 'Bitte zuerst anmelden.'});
+      return;
+    }
+    if (auth.user.role !== 'admin') {
+      res.status(403).json({ok: false, errorCode: 'FORBIDDEN', message: 'Nur Administratoren dürfen Benutzer bearbeiten.'});
+      return;
+    }
+    const body = (req.body || {}) as {displayName?: string; role?: 'admin' | 'user'; newPassword?: string};
+    try {
+      const result = await userStore.updateUser(req.params.id, {
+        displayName: typeof body.displayName === 'string' ? body.displayName : undefined,
+        role: body.role === 'admin' || body.role === 'user' ? body.role : undefined,
+        newPassword: typeof body.newPassword === 'string' ? body.newPassword : undefined,
+      });
+      res.setHeader('Cache-Control', 'no-store');
+      if (!result.ok) {
+        res.status(result.status).json(result);
+        return;
+      }
+      res.json(result);
+    } catch {
+      res.status(500).json({ok: false, errorCode: 'STORE_ERROR', message: 'Benutzer konnte nicht aktualisiert werden.'});
+    }
+  });
+
+  app.delete('/api/admin/users/:id', async (req, res) => {
+    if (!requireAppHeader(req, res)) return;
+    const auth = await userStore.getSessionFromToken(extractSessionToken(req));
+    if (!auth) {
+      res.status(401).json({ok: false, errorCode: 'UNAUTHORIZED', message: 'Bitte zuerst anmelden.'});
+      return;
+    }
+    if (auth.user.role !== 'admin') {
+      res.status(403).json({ok: false, errorCode: 'FORBIDDEN', message: 'Nur Administratoren dürfen Benutzer löschen.'});
+      return;
+    }
+    try {
+      const result = await userStore.deleteUser(req.params.id);
+      res.setHeader('Cache-Control', 'no-store');
+      if (!result.ok) {
+        res.status(result.status).json(result);
+        return;
+      }
+      res.json({ok: true});
+    } catch {
+      res.status(500).json({ok: false, errorCode: 'STORE_ERROR', message: 'Benutzer konnte nicht gelöscht werden.'});
+    }
+  });
+
+  const resolveEffectiveFhemConnection = async (
+    body: FhemExecuteBody
+  ): Promise<{ok: true; conn: ValidatedFhemConnection} | {ok: false; status: number; errorCode: string; message: string}> => {
+    if (managedFhem && (managedFhem.exclusive || body.useServerUpstream === true)) {
+      const timeoutMs = Math.min(30000, Math.max(1000, Number(body.timeoutMs) || 8000));
+      return {
+        ok: true,
+        conn: {
+          protocol: managedFhem.protocol,
+          host: managedFhem.host,
+          port: managedFhem.port,
+          basePath: managedFhem.basePath,
+          httpMethod: managedFhem.httpMethod,
+          csrfMode: managedFhem.csrfMode,
+          manualCsrfToken: managedFhem.manualCsrfToken,
+          timeoutMs,
+          acceptSelfSigned: managedFhem.acceptSelfSigned,
+          authType: managedFhem.authType,
+          queryTokenPair: managedFhem.queryTokenPair,
+          headers: {...managedFhem.headers},
+        },
+      };
+    }
+    return parseAndValidateFhemConnection(body);
+  };
+
+  app.post('/api/fhem/execute', async (req, res) => {
+    if (!requireAppHeader(req, res)) return;
+    if (!(await requireAuthenticatedIfEnabled(req, res))) return;
+
     const body = (req.body || {}) as FhemExecuteBody;
-    const validated = await parseAndValidateFhemConnection(body);
+    const validated = await resolveEffectiveFhemConnection(body);
     if (!validated.ok) {
       res.status(validated.status).json({
         ok: false,
@@ -629,7 +1231,6 @@ async function createApp() {
     const {
       protocol,
       host,
-      resolvedIp,
       port,
       basePath,
       httpMethod,
@@ -665,7 +1266,6 @@ async function createApp() {
         headers,
         acceptSelfSigned,
         timeoutMs,
-        pinnedIp: resolvedIp,
       });
     };
 
@@ -673,7 +1273,11 @@ async function createApp() {
       let result = await sendWithToken(manualCsrfToken);
 
       const rawAutoToken = (result.csrfTokenHeader || '').trim();
-      const isValidAutoToken = isValidFhemCsrfToken(rawAutoToken);
+      const isValidAutoToken =
+        rawAutoToken.length > 0 &&
+        rawAutoToken.length <= 128 &&
+        rawAutoToken.toLowerCase() !== 'none' &&
+        !/[\r\n\s]/.test(rawAutoToken);
 
       // In 'auto' CSRF mode, transparently retry once if FHEMWEB returns X-FHEM-csrfToken on 400/403
       if (csrfMode === 'auto' && (result.statusCode === 400 || result.statusCode === 403)) {
@@ -689,10 +1293,14 @@ async function createApp() {
             headers,
             acceptSelfSigned,
             timeoutMs: Math.min(timeoutMs, 5000),
-            pinnedIp: resolvedIp,
           });
           const probeTok = (probe.csrfTokenHeader || '').trim();
-          if (isValidFhemCsrfToken(probeTok)) {
+          if (
+            probeTok.length > 0 &&
+            probeTok.length <= 128 &&
+            probeTok.toLowerCase() !== 'none' &&
+            !/[\r\n\s]/.test(probeTok)
+          ) {
             retryToken = probeTok;
           }
         }
@@ -830,7 +1438,6 @@ async function createApp() {
         return;
       }
 
-      log('error', 'fhem_execute_network_error', {code});
       res.status(200).json({
         ok: false,
         errorCode: 'NETWORK_ERROR',
@@ -841,17 +1448,11 @@ async function createApp() {
 
   // Real-Time FHEMWEB Longpoll Proxy (streams FHEM inform events as Server-Sent Events)
   app.post('/api/fhem/longpoll', async (req, res) => {
-    if (req.get('X-Requested-With') !== 'FHEM-Control-Desk') {
-      res.status(403).json({
-        ok: false,
-        errorCode: 'CSRF_HEADER_MISSING',
-        message: 'Ungültige Anfrage-Herkunft (Header fehlt).',
-      });
-      return;
-    }
+    if (!requireAppHeader(req, res)) return;
+    if (!(await requireAuthenticatedIfEnabled(req, res))) return;
 
     const body = (req.body || {}) as FhemExecuteBody;
-    const validated = await parseAndValidateFhemConnection(body);
+    const validated = await resolveEffectiveFhemConnection(body);
     if (!validated.ok) {
       res.status(validated.status).json({
         ok: false,
@@ -864,7 +1465,6 @@ async function createApp() {
     const {
       protocol,
       host,
-      resolvedIp,
       port,
       basePath,
       csrfMode,
@@ -888,7 +1488,6 @@ async function createApp() {
           headers,
           acceptSelfSigned,
           timeoutMs: Math.min(timeoutMs, 5000),
-          pinnedIp: resolvedIp,
         });
         if (probe.csrfTokenHeader && isValidFhemCsrfToken(probe.csrfTokenHeader)) {
           effectiveCsrf = probe.csrfTokenHeader.trim();
@@ -968,7 +1567,6 @@ async function createApp() {
           Accept: 'text/plain, application/json, */*',
           Connection: 'keep-alive',
         },
-        lookup: pinnedLookup(resolvedIp),
         ...(isHttps ? {rejectUnauthorized: !acceptSelfSigned} : {}),
       };
 
@@ -1155,14 +1753,8 @@ async function createApp() {
 
   // OpenAI-compatible AI Assistant Proxy (avoids browser CORS issues, never logs keys)
   app.post('/api/ai/chat', async (req, res) => {
-    if (req.get('X-Requested-With') !== 'FHEM-Control-Desk') {
-      res.status(403).json({
-        ok: false,
-        errorCode: 'CSRF_HEADER_MISSING',
-        message: 'Ungültige Anfrage-Herkunft (Header fehlt).',
-      });
-      return;
-    }
+    if (!requireAppHeader(req, res)) return;
+    if (!(await requireAuthenticatedIfEnabled(req, res))) return;
 
     const body = (req.body || {}) as {
       baseUrl?: string;
@@ -1173,10 +1765,12 @@ async function createApp() {
       timeoutMs?: number;
     };
 
-    const envBaseUrl = (process.env.AI_BASE_URL || '').trim();
-    const bodyBaseUrl = typeof body.baseUrl === 'string' ? body.baseUrl.trim() : '';
-    const rawBaseUrl = bodyBaseUrl || envBaseUrl;
-    const bodyApiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
+    const rawBaseUrl =
+      (typeof body.baseUrl === 'string' && body.baseUrl.trim()) ||
+      (process.env.AI_BASE_URL || '').trim();
+    const apiKey =
+      (typeof body.apiKey === 'string' && body.apiKey.trim()) ||
+      (process.env.AI_API_KEY || '').trim();
     const model =
       (typeof body.model === 'string' && body.model.trim()) ||
       (process.env.AI_MODEL || '').trim();
@@ -1220,19 +1814,7 @@ async function createApp() {
       return;
     }
 
-    // The server-side AI_API_KEY is only ever sent to the origin configured in AI_BASE_URL.
-    let envKeyAllowed = false;
-    if (envBaseUrl) {
-      try {
-        envKeyAllowed = new URL(envBaseUrl).origin === parsedUrl.origin;
-      } catch {
-        envKeyAllowed = false;
-      }
-    }
-    const apiKey = bodyApiKey || (envKeyAllowed ? (process.env.AI_API_KEY || '').trim() : '');
-
-    const targetHostname = parsedUrl.hostname.replace(/^\[|\]$/g, '');
-    const hostCheck = await validateTargetHost(targetHostname, 'AI_ALLOWED_HOSTS');
+    const hostCheck = await validateTargetHost(parsedUrl.hostname, 'AI_ALLOWED_HOSTS');
     if (!hostCheck.ok) {
       res.status(400).json({
         ok: false,
@@ -1277,12 +1859,10 @@ async function createApp() {
     }
 
     // Build /chat/completions endpoint cleanly without duplicating the suffix
-    let endpointPath = parsedUrl.pathname.replace(/\/+$/, '');
-    if (!endpointPath.endsWith('/chat/completions')) {
-      endpointPath = `${endpointPath}/chat/completions`;
-    }
-    const isHttpsTarget = parsedUrl.protocol === 'https:';
-    const targetPort = parsedUrl.port ? Number(parsedUrl.port) : isHttpsTarget ? 443 : 80;
+    const normalizedBase = parsedUrl.toString().replace(/\/+$/, '');
+    const endpoint = normalizedBase.endsWith('/chat/completions')
+      ? normalizedBase
+      : `${normalizedBase}/chat/completions`;
 
     const timeoutMs = Math.min(60000, Math.max(5000, Number(body.timeoutMs) || 45000));
     const temperature =
@@ -1290,36 +1870,32 @@ async function createApp() {
         ? Math.max(0, Math.min(1.5, body.temperature))
         : 0.2;
 
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const startedAt = Date.now();
+
     try {
       const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
         Accept: 'application/json',
-        'User-Agent': 'FHEM-Control-Desk/1.0',
       };
-      if (apiKey && !/[\r\n]/.test(apiKey)) {
+      if (apiKey) {
         headers.Authorization = `Bearer ${apiKey}`;
       }
 
-      // Pinned to the validated IP; redirects are intentionally not followed.
-      const upstream = await executeFhemHttpRequest({
-        protocol: isHttpsTarget ? 'https' : 'http',
-        host: targetHostname,
-        port: targetPort,
+      const upstream = await fetch(endpoint, {
         method: 'POST',
-        pathWithQuery: `${endpointPath}${parsedUrl.search}`,
-        bodyPayload: JSON.stringify({
+        headers,
+        body: JSON.stringify({
           model,
           messages: sanitizedMessages,
           temperature,
         }),
-        contentType: 'application/json',
-        headers,
-        acceptSelfSigned: false,
-        timeoutMs,
-        pinnedIp: hostCheck.resolvedIp,
+        signal: controller.signal,
       });
 
-      const latencyMs = upstream.latencyMs;
-      const upstreamOk = upstream.statusCode >= 200 && upstream.statusCode < 300;
+      const latencyMs = Date.now() - startedAt;
+      const rawText = await upstream.text();
 
       let parsed: {
         choices?: Array<{message?: {content?: string | Array<{type?: string; text?: string}>}}>;
@@ -1328,28 +1904,28 @@ async function createApp() {
         error?: {message?: string; type?: string; code?: string};
       } | null = null;
       try {
-        parsed = JSON.parse(upstream.body);
+        parsed = JSON.parse(rawText);
       } catch {
         parsed = null;
       }
 
-      if (!upstreamOk) {
+      if (!upstream.ok) {
         const providerMsg = parsed?.error?.message;
-        let friendly = `KI-Endpunkt antwortete mit HTTP ${upstream.statusCode}.`;
-        if (upstream.statusCode === 401) {
+        let friendly = `KI-Endpunkt antwortete mit HTTP ${upstream.status}.`;
+        if (upstream.status === 401) {
           friendly = 'API-Key ungültig oder nicht autorisiert (HTTP 401). Bitte Key prüfen.';
-        } else if (upstream.statusCode === 403) {
+        } else if (upstream.status === 403) {
           friendly = 'Zugriff vom KI-Anbieter verweigert (HTTP 403).';
-        } else if (upstream.statusCode === 404) {
+        } else if (upstream.status === 404) {
           friendly = `Endpunkt oder Modell „${model}“ nicht gefunden (HTTP 404). Basis-URL (meist mit /v1) prüfen.`;
-        } else if (upstream.statusCode === 429) {
+        } else if (upstream.status === 429) {
           friendly = 'Rate-Limit oder Kontingent beim KI-Anbieter überschritten (HTTP 429).';
         }
         res.status(200).json({
           ok: false,
-          statusCode: upstream.statusCode,
+          statusCode: upstream.status,
           latencyMs,
-          errorCode: `HTTP_${upstream.statusCode}`,
+          errorCode: `HTTP_${upstream.status}`,
           message: providerMsg ? `${friendly} (${providerMsg.slice(0, 180)})` : friendly,
         });
         return;
@@ -1366,7 +1942,7 @@ async function createApp() {
       if (!content.trim()) {
         res.status(200).json({
           ok: false,
-          statusCode: upstream.statusCode,
+          statusCode: upstream.status,
           latencyMs,
           errorCode: 'EMPTY_RESPONSE',
           message: 'Der KI-Endpunkt hat eine leere Antwort zurückgegeben.',
@@ -1382,8 +1958,8 @@ async function createApp() {
         latencyMs,
       });
     } catch (err: unknown) {
-      const error = err as NodeJS.ErrnoException & {message?: string};
-      if (error.code === 'ETIMEDOUT' || error.message === 'REQUEST_TIMEOUT') {
+      const error = err as {name?: string; message?: string};
+      if (error?.name === 'AbortError') {
         res.status(200).json({
           ok: false,
           errorCode: 'TIMEOUT',
@@ -1391,12 +1967,13 @@ async function createApp() {
         });
         return;
       }
-      log('error', 'ai_chat_network_error', {code: error.code || ''});
       res.status(200).json({
         ok: false,
         errorCode: 'NETWORK_ERROR',
         message: 'Verbindung zum OpenAI-kompatiblen Endpunkt fehlgeschlagen. URL und Netzwerk prüfen.',
       });
+    } finally {
+      clearTimeout(timer);
     }
   });
 
@@ -1422,7 +1999,7 @@ async function createApp() {
       });
 
     viteReady.catch((err) => {
-      log('error', 'vite_init_failed', {error: String(err)});
+      console.error('Failed to initialize Vite dev middleware:', err);
       process.exit(1);
     });
 
@@ -1479,19 +2056,18 @@ async function createApp() {
   }
 
   httpServer.on('error', (err) => {
-    log('error', 'http_server_failed', {error: String(err)});
+    console.error('HTTP server failed to start:', err);
     process.exit(1);
   });
 
   httpServer.listen(PORT, HOST, () => {
-    log('info', 'server_started', {host: HOST, port: PORT, env: process.env.NODE_ENV || 'development'});
+    console.log(`FHEM Control Desk server running on http://${HOST}:${PORT}`);
   });
 
   let shuttingDown = false;
   const shutdown = () => {
     if (shuttingDown) return;
     shuttingDown = true;
-    log('info', 'server_shutdown');
     const forceExit = setTimeout(() => process.exit(0), 2000);
     forceExit.unref();
     Promise.resolve(viteInstance?.close())
@@ -1506,6 +2082,6 @@ async function createApp() {
 }
 
 createApp().catch((err) => {
-  log('error', 'fatal_startup_error', {error: String(err)});
+  console.error('Fatal error starting FHEM Control Desk server:', err);
   process.exit(1);
 });

@@ -4,6 +4,7 @@ import type {
   ActiveTab,
   AiAssistantConfig,
   AppPreferences,
+  AuthStatus,
   ChartTarget,
   CommandExecutionResult,
   ConnectionStatus,
@@ -12,8 +13,10 @@ import type {
   FhemDevice,
   FhemEventItem,
   FhemLogEntry,
+  ManagedFhemInfo,
   MediaPickerTarget,
   TileSize,
+  UserAccount,
 } from './types/fhem';
 import {
   clearAllLocalData,
@@ -31,6 +34,12 @@ import {
   savePreferences,
 } from './lib/secureStorage';
 import {
+  fetchAuthStatus,
+  fetchSyncedProfile,
+  logoutAccount,
+  saveSyncedProfile,
+} from './lib/profileClient';
+import {
   applyLongpollUpdateToDevices,
   executeFhemCommand,
   extractSchedulesFromDevices,
@@ -40,18 +49,23 @@ import {
 } from './lib/fhemClient';
 import {resolveDeviceImage, resolveRoomImage} from './lib/roomVisuals';
 import {isDeviceChartable} from './lib/sensorHistory';
+import {useDeviceViewport} from './hooks/useDeviceViewport';
 import {AppHeader} from './components/AppHeader';
 import {BottomNav, type SidebarRoomItem} from './components/BottomNav';
+import {MobileHeader} from './components/MobileHeader';
+import {MobileBottomNav} from './components/MobileBottomNav';
 import {DashboardView} from './components/DashboardView';
 import {RoomsView} from './components/RoomsView';
 import {DevicesView} from './components/DevicesView';
 import {CalendarView} from './components/CalendarView';
 import {AiAssistantView} from './components/AiAssistantView';
-import {SettingsView} from './components/SettingsView';
+import {SettingsView, type SettingsSection} from './components/SettingsView';
 
 const ChartsView = lazy(() =>
   import('./components/ChartsView').then((mod) => ({default: mod.ChartsView}))
 );
+import {AccountModal} from './components/AccountModal';
+import {AuthGateScreen} from './components/AuthGateScreen';
 import {DeviceDetailSheet} from './components/DeviceDetailSheet';
 import {GlobalSearchModal} from './components/GlobalSearchModal';
 import {ConfirmDialog, type ConfirmDialogRequest} from './components/ConfirmDialog';
@@ -64,6 +78,33 @@ interface ToastMessage {
   id: number;
   tone: 'success' | 'error';
   text: string;
+}
+
+function applyManagedFhemConfig(
+  base: FhemConnectionConfig,
+  managed?: ManagedFhemInfo
+): FhemConnectionConfig {
+  if (!managed?.enabled) {
+    return base.useServerUpstream ? {...base, useServerUpstream: false} : base;
+  }
+  const shouldActivate =
+    managed.exclusive || Boolean(base.useServerUpstream) || base.mode === 'local_instance';
+  if (!shouldActivate) {
+    return base;
+  }
+  return {
+    ...base,
+    mode: 'remote_server',
+    transport: 'proxy',
+    useServerUpstream: true,
+    protocol: managed.protocol || base.protocol,
+    host: managed.host || base.host,
+    port: managed.port || base.port,
+    basePath: managed.basePath || base.basePath,
+    httpMethod: managed.httpMethod || base.httpMethod,
+    csrfMode: managed.csrfMode || base.csrfMode,
+    authType: managed.authType || base.authType,
+  };
 }
 
 export default function App() {
@@ -102,15 +143,35 @@ export default function App() {
   devicesRef.current = devices;
   eventsPausedRef.current = eventsPaused;
 
+  // User Profile & Cross-Device Sync
+  const [authStatus, setAuthStatus] = useState<AuthStatus>({
+    initialized: false,
+    userCount: 0,
+    authenticated: false,
+    user: null,
+    requireLogin: true,
+    bootstrapTokenRequired: false,
+  });
+  const [currentUser, setCurrentUser] = useState<UserAccount | null>(null);
+  const [accountModalOpen, setAccountModalOpen] = useState(false);
+  const [profileSyncing, setProfileSyncing] = useState(false);
+  const [lastProfileSyncedAt, setLastProfileSyncedAt] = useState<string | null>(null);
+  const [settingsInitialSection, setSettingsInitialSection] = useState<SettingsSection | null>(null);
+  const suppressAutoSyncRef = useRef(false);
+
   // Modals & navigation helpers
   const [selectedDeviceName, setSelectedDeviceName] = useState<string | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const [themeModalOpen, setThemeModalOpen] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [defineModalOpen, setDefineModalOpen] = useState(false);
   const [defineDefaultType, setDefineDefaultType] = useState<string | undefined>(undefined);
   const [mediaPickerTarget, setMediaPickerTarget] = useState<MediaPickerTarget | null>(null);
   const [confirmRequest, setConfirmRequest] = useState<ConfirmDialogRequest | null>(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
+
+  const viewMode = preferences.viewMode || 'auto';
+  const {isMobileView} = useDeviceViewport(viewMode);
 
   const [selectedRoom, setSelectedRoom] = useState<string | null>(null);
   const [initialRoomFilter, setInitialRoomFilter] = useState<string | null>(null);
@@ -155,6 +216,8 @@ export default function App() {
       } else if (e.key === 'Escape') {
         setSearchOpen(false);
         setThemeModalOpen(false);
+        setMobileMenuOpen(false);
+        setAccountModalOpen(false);
         setSelectedDeviceName(null);
       }
     };
@@ -213,15 +276,16 @@ export default function App() {
     [config, eventsPaused, showToast, syncMonitorData]
   );
 
-  // Initial load from encrypted local keystore + IndexedDB
+  // Initial load from encrypted local keystore + IndexedDB + server auth status
   useEffect(() => {
     let mounted = true;
     (async () => {
-      const [loadedCfg, loadedAiCfg, loadedPrefs, loadedMedia] = await Promise.all([
+      const [loadedCfg, loadedAiCfg, loadedPrefs, loadedMedia, serverAuth] = await Promise.all([
         loadEncryptedConnectionConfig(),
         loadEncryptedAiConfig(),
         loadPreferences(),
         loadCustomMedia(),
+        fetchAuthStatus(),
       ]);
       if (!mounted) return;
       setConfig(loadedCfg.config);
@@ -232,17 +296,218 @@ export default function App() {
       setAiKeystoreUpdatedAt(loadedAiCfg.updatedAt);
       setPreferences(loadedPrefs);
       setCustomMedia(loadedMedia);
+      let shouldLoadDevices = true;
+      let effectiveCfg = loadedCfg.config;
+      if (serverAuth) {
+        setAuthStatus(serverAuth);
+        if (serverAuth.authenticated && serverAuth.user) {
+          setCurrentUser(serverAuth.user);
+          // Pull latest synced profile silently when restored via HttpOnly session cookie
+          const syncedRes = await fetchSyncedProfile();
+          if (!mounted) return;
+          if (syncedRes.ok && syncedRes.hasProfile && syncedRes.profile) {
+            suppressAutoSyncRef.current = true;
+            window.setTimeout(() => {
+              suppressAutoSyncRef.current = false;
+            }, 1500);
+            const synced = syncedRes.profile;
+            effectiveCfg = applyManagedFhemConfig(
+              {...DEFAULT_CONNECTION_CONFIG, ...synced.config},
+              serverAuth.managedFhem
+            );
+            const mergedAi: AiAssistantConfig = {...DEFAULT_AI_CONFIG, ...synced.aiConfig};
+            const mergedPrefs: AppPreferences = {...DEFAULT_PREFERENCES, ...synced.preferences};
+            const mergedMedia: CustomMediaStore = {
+              rooms: synced.customMedia?.rooms || {},
+              devices: synced.customMedia?.devices || {},
+              floorplan: synced.customMedia?.floorplan,
+            };
+            setConfig(effectiveCfg);
+            setAiConfig(mergedAi);
+            setPreferences(mergedPrefs);
+            setCustomMedia(mergedMedia);
+            const [savedCfg, savedAi] = await Promise.all([
+              saveEncryptedConnectionConfig(effectiveCfg),
+              saveEncryptedAiConfig(mergedAi),
+              savePreferences(mergedPrefs),
+              saveCustomMedia(mergedMedia),
+            ]);
+            if (!mounted) return;
+            setKeystoreEncrypted(savedCfg.encrypted);
+            setKeystoreUpdatedAt(savedCfg.updatedAt);
+            setAiKeystoreEncrypted(savedAi.encrypted);
+            setAiKeystoreUpdatedAt(savedAi.updatedAt);
+            setLastProfileSyncedAt(new Date().toLocaleTimeString('de-DE'));
+          } else {
+            effectiveCfg = applyManagedFhemConfig(effectiveCfg, serverAuth.managedFhem);
+            setConfig(effectiveCfg);
+          }
+        } else if (serverAuth.requireLogin) {
+          shouldLoadDevices = false;
+        } else {
+          effectiveCfg = applyManagedFhemConfig(effectiveCfg, serverAuth.managedFhem);
+          setConfig(effectiveCfg);
+        }
+      }
       setBootstrapped(true);
-      await refreshDevices(loadedCfg.config);
+      if (shouldLoadDevices) {
+        await refreshDevices(effectiveCfg);
+      }
     })();
     return () => {
       mounted = false;
     };
   }, []);
 
+  const refreshAuthStatus = useCallback(async (): Promise<AuthStatus | null> => {
+    const next = await fetchAuthStatus();
+    if (next) {
+      setAuthStatus(next);
+      if (!next.authenticated) {
+        setCurrentUser(null);
+      } else if (next.user) {
+        setCurrentUser(next.user);
+      }
+    }
+    return next;
+  }, []);
+
+  const pushProfileToServer = useCallback(
+    async (silent = false) => {
+      setProfileSyncing(true);
+      const res = await saveSyncedProfile({
+        config,
+        aiConfig,
+        preferences,
+        customMedia,
+      });
+      setProfileSyncing(false);
+      if (res.ok) {
+        setLastProfileSyncedAt(new Date().toLocaleTimeString('de-DE'));
+        if (!silent) showToast('Profil erfolgreich auf dem Server gesichert.');
+      } else if (!silent) {
+        showToast(res.message || 'Profil-Synchronisation fehlgeschlagen.', 'error');
+      }
+    },
+    [aiConfig, config, customMedia, preferences, showToast]
+  );
+
+  const pullProfileFromServer = useCallback(
+    async (silent = false, managedOverride?: ManagedFhemInfo): Promise<boolean> => {
+      setProfileSyncing(true);
+      const res = await fetchSyncedProfile();
+      setProfileSyncing(false);
+
+      if (!res.ok) {
+        if (!silent) showToast(res.message || 'Profil konnte nicht geladen werden.', 'error');
+        return false;
+      }
+      if (!res.hasProfile || !res.profile) {
+        if (!silent) showToast('Auf dem Server liegt noch kein gespeichertes Profil vor.');
+        return false;
+      }
+
+      suppressAutoSyncRef.current = true;
+      window.setTimeout(() => {
+        suppressAutoSyncRef.current = false;
+      }, 1500);
+
+      const synced = res.profile;
+      const mergedConfig: FhemConnectionConfig = applyManagedFhemConfig(
+        {...DEFAULT_CONNECTION_CONFIG, ...synced.config},
+        managedOverride ?? authStatus.managedFhem
+      );
+      const mergedAi: AiAssistantConfig = {...DEFAULT_AI_CONFIG, ...synced.aiConfig};
+      const mergedPrefs: AppPreferences = {...DEFAULT_PREFERENCES, ...synced.preferences};
+      const mergedMedia: CustomMediaStore = {
+        rooms: synced.customMedia?.rooms || {},
+        devices: synced.customMedia?.devices || {},
+        floorplan: synced.customMedia?.floorplan,
+      };
+
+      setConfig(mergedConfig);
+      setAiConfig(mergedAi);
+      setPreferences(mergedPrefs);
+      setCustomMedia(mergedMedia);
+
+      const [savedCfg, savedAi] = await Promise.all([
+        saveEncryptedConnectionConfig(mergedConfig),
+        saveEncryptedAiConfig(mergedAi),
+        savePreferences(mergedPrefs),
+        saveCustomMedia(mergedMedia),
+      ]);
+      setKeystoreEncrypted(savedCfg.encrypted);
+      setKeystoreUpdatedAt(savedCfg.updatedAt);
+      setAiKeystoreEncrypted(savedAi.encrypted);
+      setAiKeystoreUpdatedAt(savedAi.updatedAt);
+      setLastProfileSyncedAt(new Date().toLocaleTimeString('de-DE'));
+
+      await refreshDevices(mergedConfig, true);
+      if (!silent) showToast('Profil vom Server geladen und angewendet.');
+      return true;
+    },
+    [authStatus.managedFhem, refreshDevices, showToast]
+  );
+
+  const handleAuthenticated = useCallback(
+    async (user: UserAccount, isBootstrap: boolean) => {
+      setCurrentUser(user);
+      const latestAuth = await refreshAuthStatus();
+      const effectiveManaged = latestAuth?.managedFhem ?? authStatus.managedFhem;
+      const nextCfg = applyManagedFhemConfig(config, effectiveManaged);
+      if (nextCfg !== config) {
+        setConfig(nextCfg);
+      }
+      if (isBootstrap) {
+        await pushProfileToServer(true);
+        await refreshDevices(nextCfg, true);
+        showToast(`Admin-Profil „${user.displayName}“ erstellt & gesichert.`);
+        return;
+      }
+      const hadServerProfile = await pullProfileFromServer(true, effectiveManaged);
+      if (hadServerProfile) {
+        showToast(`Willkommen zurück, ${user.displayName} — Profil geladen.`);
+      } else {
+        await pushProfileToServer(true);
+        await refreshDevices(nextCfg, true);
+        showToast(`Angemeldet als ${user.displayName} — lokale Einstellungen gesichert.`);
+      }
+    },
+    [authStatus.managedFhem, config, pullProfileFromServer, pushProfileToServer, refreshAuthStatus, refreshDevices, showToast]
+  );
+
+  const handleLogout = useCallback(async () => {
+    await logoutAccount();
+    setCurrentUser(null);
+    setLastProfileSyncedAt(null);
+    if (authStatus.requireLogin) {
+      setDevices([]);
+      setEvents([]);
+      setLogs([]);
+      setSelectedDeviceName(null);
+    }
+    await refreshAuthStatus();
+    showToast('Abgemeldet. Lokale Daten bleiben auf diesem Gerät erhalten.');
+  }, [authStatus.requireLogin, refreshAuthStatus, showToast]);
+
+  // Debounced auto-sync to server whenever settings/media/prefs change while logged in
+  useEffect(() => {
+    if (!bootstrapped || !currentUser || suppressAutoSyncRef.current) return;
+    const timer = window.setTimeout(() => {
+      if (!suppressAutoSyncRef.current) {
+        void pushProfileToServer(true);
+      }
+    }, 1200);
+    return () => window.clearTimeout(timer);
+  }, [bootstrapped, currentUser, config, aiConfig, preferences, customMedia, pushProfileToServer]);
+
   // Real-time FHEMWEB Longpoll stream (local test bus + remote proxy/direct)
   useEffect(() => {
     if (!bootstrapped) return;
+    if (authStatus.requireLogin && !currentUser) {
+      setStatus((prev) => ({...prev, longpollState: 'off'}));
+      return;
+    }
     if (!config.longpollEnabled) {
       setStatus((prev) => ({...prev, longpollState: 'off'}));
       return;
@@ -286,11 +551,12 @@ export default function App() {
     return () => {
       controller.stop();
     };
-  }, [bootstrapped, config]);
+  }, [bootstrapped, config, authStatus.requireLogin, currentUser]);
 
   // Auto-Polling timer (relaxed safety-sync while Longpoll is actively connected)
   useEffect(() => {
     if (!bootstrapped || config.pollIntervalSec <= 0) return;
+    if (authStatus.requireLogin && !currentUser) return;
     const isLongpollConnected = config.longpollEnabled && status.longpollState === 'connected';
     const intervalSec = isLongpollConnected
       ? Math.max(config.pollIntervalSec * 4, 60)
@@ -299,7 +565,7 @@ export default function App() {
       void refreshDevices(config, true);
     }, intervalSec * 1000);
     return () => window.clearInterval(id);
-  }, [bootstrapped, config, status.longpollState, refreshDevices]);
+  }, [bootstrapped, config, status.longpollState, refreshDevices, authStatus.requireLogin, currentUser]);
 
   const updatePreferences = useCallback((patch: Partial<AppPreferences>) => {
     setPreferences((prev) => {
@@ -674,13 +940,14 @@ export default function App() {
         setConfirmBusy(true);
         await clearAllLocalData();
         await localFhemEngine.reset();
-        setConfig(DEFAULT_CONNECTION_CONFIG);
+        const resetCfg = applyManagedFhemConfig(DEFAULT_CONNECTION_CONFIG, authStatus.managedFhem);
+        setConfig(resetCfg);
         setAiConfig(DEFAULT_AI_CONFIG);
         setPreferences(DEFAULT_PREFERENCES);
         setCustomMedia(DEFAULT_CUSTOM_MEDIA);
         setKeystoreUpdatedAt(null);
         setAiKeystoreUpdatedAt(null);
-        await refreshDevices(DEFAULT_CONNECTION_CONFIG);
+        await refreshDevices(resetCfg);
         setConfirmBusy(false);
         showToast('Lokale Daten zurückgesetzt.');
       },
@@ -731,44 +998,89 @@ export default function App() {
     setActiveTab('charts');
   }, []);
 
+  if (!bootstrapped) {
+    return (
+      <div className="min-h-screen theme-canvas text-slate-900 dark:text-[#E6EDF3] flex items-center justify-center px-4">
+        <div className="flex flex-col items-center gap-3">
+          <img
+            src="/icon.svg"
+            alt="FHEM Control Desk"
+            className="h-12 w-12 rounded-2xl animate-pulse"
+            referrerPolicy="no-referrer"
+          />
+          <span className="text-xs font-medium text-slate-500 dark:text-slate-400">
+            FHEM Control Desk wird geladen…
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  if (authStatus.requireLogin && !currentUser) {
+    return (
+      <AuthGateScreen
+        authStatus={authStatus}
+        onAuthenticated={handleAuthenticated}
+      />
+    );
+  }
+
   return (
     <div className="min-h-screen theme-canvas text-slate-900 dark:text-[#E6EDF3] transition-colors">
-      {/* Desktop Sidebar & Mobile Bottom Navigation */}
-      <BottomNav
-        activeTab={activeTab}
-        selectedRoom={selectedRoom}
-        rooms={sidebarRooms}
-        onSelectTab={setActiveTab}
-        onSelectRoom={handleOpenRoom}
-        deviceCount={devices.length}
-        errorCount={errorCount}
-        scheduleCount={scheduleCount}
-        chartableCount={chartableCount}
-        theme={preferences.theme}
-        colorTheme={preferences.colorTheme}
-        onToggleTheme={() =>
-          updatePreferences({theme: preferences.theme === 'dark' ? 'light' : 'dark'})
-        }
-        onSelectColorTheme={(id) => updatePreferences({colorTheme: id})}
-      />
+      {/* Desktop Left Sidebar (only mounted in Desktop view) */}
+      {!isMobileView && (
+        <BottomNav
+          activeTab={activeTab}
+          selectedRoom={selectedRoom}
+          rooms={sidebarRooms}
+          onSelectTab={setActiveTab}
+          onSelectRoom={handleOpenRoom}
+          deviceCount={devices.length}
+          errorCount={errorCount}
+          scheduleCount={scheduleCount}
+          chartableCount={chartableCount}
+          theme={preferences.theme}
+          colorTheme={preferences.colorTheme}
+          viewMode={viewMode}
+          onToggleTheme={() =>
+            updatePreferences({theme: preferences.theme === 'dark' ? 'light' : 'dark'})
+          }
+          onSelectColorTheme={(id) => updatePreferences({colorTheme: id})}
+          onChangeViewMode={(mode) => updatePreferences({viewMode: mode})}
+        />
+      )}
 
       {/* Main Layout Shell */}
-      <div className="lg:pl-64 flex min-h-screen flex-col">
-        <AppHeader
-          status={status}
-          refreshing={refreshing}
-          onRefresh={() => void refreshDevices()}
-          onOpenSearch={() => setSearchOpen(true)}
-          onOpenSaveConfig={requestSaveConfig}
-          onOpenThemePicker={() => setThemeModalOpen(true)}
-          onOpenAssistant={() => setActiveTab('assistant')}
-          onOpenCalendar={() => setActiveTab('calendar')}
-          onOpenCharts={() => setActiveTab('charts')}
-        />
+      <div className={`${isMobileView ? '' : 'pl-64'} flex min-h-screen flex-col`}>
+        {isMobileView ? (
+          <MobileHeader
+            activeTab={activeTab}
+            selectedRoom={selectedRoom}
+            status={status}
+            refreshing={refreshing}
+            currentUser={currentUser}
+            onRefresh={() => void refreshDevices()}
+            onOpenSearch={() => setSearchOpen(true)}
+            onOpenAccount={() => setAccountModalOpen(true)}
+            onOpenMenu={() => setMobileMenuOpen(true)}
+          />
+        ) : (
+          <AppHeader
+            status={status}
+            refreshing={refreshing}
+            currentUser={currentUser}
+            onRefresh={() => void refreshDevices()}
+            onOpenSearch={() => setSearchOpen(true)}
+            onOpenSaveConfig={requestSaveConfig}
+            onOpenThemePicker={() => setThemeModalOpen(true)}
+            onOpenAssistant={() => setActiveTab('assistant')}
+            onOpenAccount={() => setAccountModalOpen(true)}
+          />
+        )}
 
         {/* Connection Error Alert Banner */}
         {status.errorMessage && !status.online && (
-          <div className="mx-auto w-full max-w-7xl px-4 pt-4 lg:px-6">
+          <div className={isMobileView ? 'mx-auto w-full max-w-2xl px-3 pt-3' : 'mx-auto w-full max-w-7xl px-6 pt-4'}>
             <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-red-300/80 bg-red-500/10 px-4 py-3 text-xs text-red-700 dark:border-red-500/40 dark:text-red-300">
               <div className="flex items-center gap-2.5">
                 <AlertTriangle className="h-4 w-4 shrink-0" />
@@ -786,10 +1098,18 @@ export default function App() {
         )}
 
         {/* Active View Content */}
-        <main className="mx-auto w-full max-w-7xl flex-1 px-4 pt-5 pb-24 lg:px-6 lg:pb-8">
+        <main
+          className={
+            isMobileView
+              ? 'mx-auto w-full max-w-2xl flex-1 px-3 pt-3.5 pb-24'
+              : 'mx-auto w-full max-w-7xl flex-1 px-6 pt-5 pb-8'
+          }
+        >
           {activeTab === 'dashboard' && (
             <DashboardView
               devices={devices}
+              config={config}
+              connectionStatus={status}
               favorites={preferences.favorites}
               compactCards={preferences.compactCards}
               tileSizes={preferences.tileSizes || {}}
@@ -798,6 +1118,7 @@ export default function App() {
               showVisuals={preferences.showVisuals}
               customMedia={customMedia}
               refreshing={refreshing}
+              isMobileView={isMobileView}
               onRefresh={() => refreshDevices()}
               onCommand={(cmd) => void handleExecuteCommand(cmd)}
               onOpenDetail={(dev) => setSelectedDeviceName(dev.name)}
@@ -885,6 +1206,7 @@ export default function App() {
             >
               <ChartsView
                 devices={devices}
+                config={config}
                 initialTarget={chartTarget}
                 onClearInitialTarget={() => setChartTarget(null)}
                 onOpenDetail={(dev) => setSelectedDeviceName(dev.name)}
@@ -932,10 +1254,49 @@ export default function App() {
               }}
               onRequestResetLocalData={requestResetLocalData}
               onOpenAiAssistant={() => setActiveTab('assistant')}
+              authStatus={authStatus}
+              currentUser={currentUser}
+              profileSyncing={profileSyncing}
+              lastProfileSyncedAt={lastProfileSyncedAt}
+              initialSection={settingsInitialSection}
+              onClearInitialSection={() => setSettingsInitialSection(null)}
+              onOpenAccountModal={() => setAccountModalOpen(true)}
+              onPullProfile={async () => {
+                await pullProfileFromServer(false);
+              }}
+              onPushProfile={() => pushProfileToServer(false)}
+              onLogout={handleLogout}
+              onRefreshAuthStatus={async () => {
+                await refreshAuthStatus();
+              }}
             />
           )}
         </main>
       </div>
+
+      {/* Dedicated Mobile Bottom Navigation & Thumb-Zone Menu Drawer */}
+      {isMobileView && (
+        <MobileBottomNav
+          activeTab={activeTab}
+          status={status}
+          currentUser={currentUser}
+          errorCount={errorCount}
+          scheduleCount={scheduleCount}
+          theme={preferences.theme}
+          colorTheme={preferences.colorTheme}
+          viewMode={viewMode}
+          menuOpen={mobileMenuOpen}
+          onSetMenuOpen={setMobileMenuOpen}
+          onSelectTab={setActiveTab}
+          onToggleTheme={() =>
+            updatePreferences({theme: preferences.theme === 'dark' ? 'light' : 'dark'})
+          }
+          onOpenThemePicker={() => setThemeModalOpen(true)}
+          onOpenSaveConfig={requestSaveConfig}
+          onOpenAccount={() => setAccountModalOpen(true)}
+          onChangeViewMode={(mode) => updatePreferences({viewMode: mode})}
+        />
+      )}
 
       {/* Overlays & Modals */}
       <DeviceDetailSheet
@@ -1027,9 +1388,35 @@ export default function App() {
         onSelectColorTheme={(id) => updatePreferences({colorTheme: id})}
       />
 
+      <AccountModal
+        open={accountModalOpen}
+        authStatus={authStatus}
+        currentUser={currentUser}
+        syncing={profileSyncing}
+        lastSyncedAt={lastProfileSyncedAt}
+        onClose={() => setAccountModalOpen(false)}
+        onAuthenticated={handleAuthenticated}
+        onLogout={handleLogout}
+        onPullProfile={async () => {
+          await pullProfileFromServer(false);
+        }}
+        onPushProfile={() => pushProfileToServer(false)}
+        onOpenUserManagement={() => {
+          setAccountModalOpen(false);
+          setSettingsInitialSection('profile');
+          setActiveTab('settings');
+        }}
+      />
+
       {/* Toast Notification */}
       {toast && (
-        <div className="fixed bottom-20 lg:bottom-6 right-4 z-50 flex max-w-sm items-center gap-2.5 rounded-2xl border border-slate-200 bg-white px-4 py-3 text-xs font-medium text-slate-900 shadow-xl dark:border-[#2A3444] dark:bg-[#1B222D] dark:text-slate-100">
+        <div
+          className={`fixed z-50 flex items-center gap-2.5 rounded-2xl border border-slate-200 bg-white px-4 py-3 text-xs font-medium text-slate-900 shadow-xl dark:border-[#2A3444] dark:bg-[#1B222D] dark:text-slate-100 ${
+            isMobileView
+              ? 'bottom-[74px] left-3 right-3 sm:left-auto sm:right-4 sm:max-w-sm'
+              : 'bottom-6 right-4 max-w-sm'
+          }`}
+        >
           {toast.tone === 'success' ? (
             <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-500" />
           ) : (

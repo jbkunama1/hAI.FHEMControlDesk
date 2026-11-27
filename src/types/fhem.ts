@@ -118,6 +118,7 @@ export interface FhemConnectionConfig {
   timeoutMs: number;
   pollIntervalSec: number; // 0 = off, 5, 10, 30, 60
   longpollEnabled: boolean;
+  useServerUpstream?: boolean;
 }
 
 export type LongpollState = 'off' | 'connecting' | 'connected' | 'reconnecting' | 'error';
@@ -180,6 +181,7 @@ export interface ScheduleEntry {
 export type ColorThemeId = 'ocean' | 'emerald' | 'amber' | 'indigo' | 'rose' | 'graphite';
 export type TileSize = 'sm' | 'wide';
 export type DashboardGrouping = 'grid' | 'rooms';
+export type ViewMode = 'auto' | 'mobile' | 'desktop';
 
 export interface AppPreferences {
   theme: 'dark' | 'light';
@@ -190,6 +192,7 @@ export interface AppPreferences {
   showVisuals: boolean;
   tileSizes: Record<string, TileSize>;
   dashboardGrouping: DashboardGrouping;
+  viewMode?: ViewMode;
 }
 
 export interface CustomMediaStore {
@@ -254,3 +257,47 @@ export interface CommandExecutionResult {
   diagnosticHint?: string;
   requestUrlPreview: string;
 }
+
+export type UserRole = 'admin' | 'user';
+
+export interface UserAccount {
+  id: string;
+  username: string;
+  displayName: string;
+  role: UserRole;
+  createdAt: string;
+  lastLoginAt: string | null;
+}
+
+export interface ManagedFhemInfo {
+  enabled: boolean;
+  exclusive: boolean;
+  displayTarget?: string;
+  protocol?: 'http' | 'https';
+  host?: string;
+  port?: number;
+  basePath?: string;
+  httpMethod?: 'GET' | 'POST';
+  csrfMode?: FhemCsrfMode;
+  authType?: FhemAuthType;
+  hasCredentials?: boolean;
+}
+
+export interface AuthStatus {
+  initialized: boolean;
+  userCount: number;
+  authenticated: boolean;
+  user: UserAccount | null;
+  requireLogin: boolean;
+  bootstrapTokenRequired: boolean;
+  managedFhem?: ManagedFhemInfo;
+}
+
+export interface SyncedUserProfile {
+  config?: Partial<FhemConnectionConfig>;
+  aiConfig?: Partial<AiAssistantConfig>;
+  preferences?: Partial<AppPreferences>;
+  customMedia?: CustomMediaStore;
+  updatedAt?: string;
+}
+

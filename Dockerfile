@@ -19,6 +19,7 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=3000
 ENV HOST=0.0.0.0
+ENV DATA_DIR=/app/data
 
 COPY package.json ./
 RUN npm install --omit=dev && npm cache clean --force
@@ -26,9 +27,12 @@ RUN npm install --omit=dev && npm cache clean --force
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/server.mjs ./server.mjs
 
+RUN mkdir -p /app/data && chown -R node:node /app/data
+
 USER node
 
 EXPOSE 3000
+VOLUME ["/app/data"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD wget -qO- http://127.0.0.1:3000/api/health >/dev/null 2>&1 || exit 1

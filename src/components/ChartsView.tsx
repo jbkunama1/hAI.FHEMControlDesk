@@ -1,4 +1,4 @@
-import React, {useEffect, useMemo, useState} from 'react';
+import React, {useEffect, useMemo, useRef, useState} from 'react';
 import {
   Area,
   AreaChart,
@@ -19,33 +19,47 @@ import {
   ArrowDownRight,
   ArrowUpRight,
   BarChart3,
+  Database,
   Download,
   Droplets,
   ExternalLink,
+  FileText,
   GitCompare,
+  Info,
   Layers,
   LineChart as LineChartIcon,
+  Loader2,
   Minus,
   Radio,
+  RefreshCw,
   Search,
   Thermometer,
   TrendingUp,
   X,
   Zap,
 } from 'lucide-react';
-import type {ChartTarget, FhemDevice} from '../types/fhem';
+import type {ChartTarget, FhemConnectionConfig, FhemDevice} from '../types/fhem';
+import {executeFhemCommand} from '../lib/fhemClient';
 import {
   buildSensorHistorySeries,
+  clearHistoryCache,
   computeSeriesStats,
+  discoverFhemLogDevices,
   extractChartableReadings,
+  fetchFhemSensorHistory,
   formatReadingMetric,
   getReadingMeta,
+  scoreFileLogMatch,
   type ChartTimeframe,
+  type FhemLogDeviceType,
+  type HistoryFetchResult,
+  type HistorySourcePreference,
   type SensorReadingOption,
 } from '../lib/sensorHistory';
 
 interface ChartsViewProps {
   devices: FhemDevice[];
+  config: FhemConnectionConfig;
   initialTarget?: ChartTarget | null;
   onClearInitialTarget?: () => void;
   onOpenDetail: (device: FhemDevice) => void;
@@ -78,6 +92,7 @@ const METRIC_FILTERS: Array<{id: MetricFilter; label: string}> = [
 
 export const ChartsView: React.FC<ChartsViewProps> = ({
   devices,
+  config,
   initialTarget,
   onClearInitialTarget,
   onOpenDetail,
@@ -90,6 +105,21 @@ export const ChartsView: React.FC<ChartsViewProps> = ({
   const [chartKind, setChartKind] = useState<ChartKind>('area');
   const [dualClimateMode, setDualClimateMode] = useState(false);
   const [compareDeviceName, setCompareDeviceName] = useState<string>('');
+
+  // FHEM DbLog / FileLog history state
+  const [sourcePreference, setSourcePreference] = useState<HistorySourcePreference>('auto');
+  const [manualLogNameDraft, setManualLogNameDraft] = useState('');
+  const [manualLogTypeDraft, setManualLogTypeDraft] = useState<FhemLogDeviceType>('DbLog');
+  const [appliedManualLog, setAppliedManualLog] = useState<{name: string; type: FhemLogDeviceType} | null>(null);
+  const [reloadNonce, setReloadNonce] = useState(0);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+  const [historyResult, setHistoryResult] = useState<HistoryFetchResult | null>(null);
+
+  const logDevices = useMemo(() => discoverFhemLogDevices(devices), [devices]);
+  const logDevicesSignature = useMemo(
+    () => logDevices.map((d) => `${d.name}:${d.type}:${d.regexp}`).join('|'),
+    [logDevices]
+  );
 
   const chartableDevices = useMemo<ChartableDeviceEntry[]>(() => {
     const entries: ChartableDeviceEntry[] = [];
@@ -218,8 +248,104 @@ export const ChartsView: React.FC<ChartsViewProps> = ({
     return match ? match.device : null;
   }, [comparableDevices, compareDeviceName, activeReading]);
 
-  const seriesData = useMemo(() => {
-    if (!activeEntry || !activeReading) return [];
+  // Keep latest object references so Longpoll ticks on unrelated devices don't re-trigger FHEM history queries
+  const activeDeviceRef = useRef<FhemDevice | null>(null);
+  activeDeviceRef.current = activeEntry?.device || null;
+  const compareDeviceRef = useRef<FhemDevice | null>(null);
+  compareDeviceRef.current = compareDevice;
+  const logDevicesRef = useRef(logDevices);
+  logDevicesRef.current = logDevices;
+  const configRef = useRef(config);
+  configRef.current = config;
+
+  const activeDeviceKey = activeEntry?.device.name || '';
+  const activeReadingKey = activeReading?.key || '';
+  const compareDeviceKey = compareDevice?.name || '';
+
+  // Reset device-specific source selection if that log device disappeared
+  useEffect(() => {
+    if (sourcePreference.startsWith('device:')) {
+      const targetName = sourcePreference.slice('device:'.length);
+      if (!logDevices.some((d) => d.name === targetName)) {
+        setSourcePreference('auto');
+      }
+    }
+  }, [logDevices, sourcePreference]);
+
+  // Fetch real historical series from FHEM DbLog / FileLog (with 60s TTL cache & clean fallback)
+  useEffect(() => {
+    const dev = activeDeviceRef.current;
+    if (!dev || !activeReadingKey) {
+      setHistoryResult(null);
+      setLoadingHistory(false);
+      return;
+    }
+
+    let cancelled = false;
+    setLoadingHistory(true);
+
+    void fetchFhemSensorHistory({
+      config: configRef.current,
+      logDevices: logDevicesRef.current,
+      device: dev,
+      readingKey: activeReadingKey,
+      timeframe,
+      secondaryReadingKey: effectiveDualClimate ? 'humidity' : null,
+      compareDevice: compareDeviceRef.current,
+      sourcePreference,
+      manualLogDevice: sourcePreference === 'manual' ? appliedManualLog : null,
+      executeCmd: executeFhemCommand,
+    })
+      .then((res) => {
+        if (!cancelled) {
+          setHistoryResult(res);
+          setLoadingHistory(false);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          const fallbackPts = buildSensorHistorySeries({
+            device: dev,
+            readingKey: activeReadingKey,
+            timeframe,
+            secondaryReadingKey: effectiveDualClimate ? 'humidity' : null,
+            compareDevice: compareDeviceRef.current,
+          });
+          setHistoryResult({
+            points: fallbackPts,
+            stats: computeSeriesStats(fallbackPts),
+            source: 'simulated',
+            rawPointCount: fallbackPts.length,
+            downsampled: false,
+            notice: 'FHEM-Verlaufsabfrage fehlgeschlagen — Vorschau aktiv.',
+            fetchedAt: Date.now(),
+          });
+          setLoadingHistory(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activeDeviceKey,
+    activeReadingKey,
+    timeframe,
+    effectiveDualClimate,
+    compareDeviceKey,
+    sourcePreference,
+    appliedManualLog,
+    logDevicesSignature,
+    reloadNonce,
+    config.mode,
+    config.host,
+    config.port,
+    config.protocol,
+    config.transport,
+  ]);
+
+  const fallbackSeriesData = useMemo(() => {
+    if (historyResult || !activeEntry || !activeReading) return [];
     return buildSensorHistorySeries({
       device: activeEntry.device,
       readingKey: activeReading.key,
@@ -227,9 +353,27 @@ export const ChartsView: React.FC<ChartsViewProps> = ({
       secondaryReadingKey: effectiveDualClimate ? 'humidity' : null,
       compareDevice,
     });
-  }, [activeEntry, activeReading, timeframe, effectiveDualClimate, compareDevice]);
+  }, [historyResult, activeEntry, activeReading, timeframe, effectiveDualClimate, compareDevice]);
 
-  const stats = useMemo(() => computeSeriesStats(seriesData), [seriesData]);
+  const seriesData = historyResult ? historyResult.points : fallbackSeriesData;
+  const stats = useMemo(
+    () => (historyResult ? historyResult.stats : computeSeriesStats(seriesData)),
+    [historyResult, seriesData]
+  );
+
+  const handleForceReloadHistory = () => {
+    clearHistoryCache();
+    setReloadNonce((n) => n + 1);
+  };
+
+  const handleApplyManualLog = (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleaned = manualLogNameDraft.trim();
+    if (!cleaned) return;
+    clearHistoryCache();
+    setAppliedManualLog({name: cleaned, type: manualLogTypeDraft});
+    setReloadNonce((n) => n + 1);
+  };
 
   const humidityMeta = getReadingMeta('humidity');
   const desiredTempValue =
@@ -294,7 +438,10 @@ export const ChartsView: React.FC<ChartsViewProps> = ({
             Diagramme & Sensorverlauf
           </h1>
           <p className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-            {chartableDevices.length} Sensoren & Geräte mit numerischen FHEM-Readings · Interaktive Verlaufsanalyse
+            {chartableDevices.length} Sensoren & Geräte ·{' '}
+            {logDevices.length > 0
+              ? `${logDevices.filter((d) => d.type === 'DbLog').length} DbLog & ${logDevices.filter((d) => d.type === 'FileLog').length} FileLog erkannt`
+              : 'Kein DbLog/FileLog erkannt (Vorschau-Modus)'}
           </p>
         </div>
 
@@ -606,6 +753,143 @@ export const ChartsView: React.FC<ChartsViewProps> = ({
                   )}
                 </div>
               )}
+
+              {/* FHEM Log Source Bar (DbLog / FileLog Auto-Detection & Override) */}
+              <div className="border-t theme-border pt-3 space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2.5">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="flex items-center gap-1.5">
+                      {historyResult?.source === 'filelog' ? (
+                        <FileText className="h-3.5 w-3.5 text-slate-400 shrink-0" />
+                      ) : (
+                        <Database className="h-3.5 w-3.5 text-slate-400 shrink-0" />
+                      )}
+                      <select
+                        value={sourcePreference}
+                        onChange={(e) => {
+                          const next = e.target.value as HistorySourcePreference;
+                          setSourcePreference(next);
+                        }}
+                        aria-label="FHEM Verlaufsquelle wählen"
+                        className="min-h-[36px] rounded-xl border theme-border bg-white px-2.5 text-xs font-medium text-slate-800 focus:border-[var(--accent-ring)] focus:outline-none dark:bg-[var(--m3-canvas)] dark:text-slate-100"
+                      >
+                        <option value="auto">
+                          Automatisch (DbLog → FileLog)
+                        </option>
+                        {logDevices.filter((d) => d.type === 'DbLog').length > 0 && (
+                          <optgroup label="FHEM DbLog">
+                            {logDevices
+                              .filter((d) => d.type === 'DbLog')
+                              .map((d) => (
+                                <option key={d.name} value={`device:${d.name}`}>
+                                  DbLog · {d.name}
+                                </option>
+                              ))}
+                          </optgroup>
+                        )}
+                        {logDevices.filter((d) => d.type === 'FileLog').length > 0 && (
+                          <optgroup label="FHEM FileLog">
+                            {logDevices
+                              .filter((d) => d.type === 'FileLog')
+                              .map((d) => {
+                                const matches = scoreFileLogMatch(d, activeEntry.device.name, activeReading.key) > 0;
+                                return (
+                                  <option key={d.name} value={`device:${d.name}`}>
+                                    FileLog · {d.name}
+                                    {matches ? ' ✓' : ''}
+                                  </option>
+                                );
+                              })}
+                          </optgroup>
+                        )}
+                        <option value="manual">Manuelles Log-Gerät…</option>
+                        <option value="simulated">Lokale Vorschau (simuliert)</option>
+                      </select>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={handleForceReloadHistory}
+                      disabled={loadingHistory}
+                      title="Verlaufsdaten neu aus FHEM laden (Cache umgehen)"
+                      className="flex min-h-[36px] items-center gap-1.5 rounded-xl border theme-border px-2.5 text-xs font-semibold text-slate-600 hover:border-[var(--accent-ring)] disabled:opacity-50 dark:text-slate-300"
+                    >
+                      <RefreshCw className={`h-3.5 w-3.5 ${loadingHistory ? 'animate-spin' : ''}`} />
+                      <span className="hidden sm:inline">Neu laden</span>
+                    </button>
+                  </div>
+
+                  {/* Active Data Source Summary */}
+                  <div
+                    className="flex items-center gap-2 text-[11px] font-medium tabular-nums"
+                    title={historyResult?.commandUsed ? `FHEM-Befehl: ${historyResult.commandUsed}` : undefined}
+                  >
+                    {loadingHistory ? (
+                      <span className="flex items-center gap-1.5 text-slate-500 dark:text-slate-400">
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        Lade aus FHEM…
+                      </span>
+                    ) : historyResult?.source === 'dblog' || historyResult?.source === 'filelog' ? (
+                      <span className="flex items-center gap-1.5 text-emerald-700 dark:text-emerald-400">
+                        <span className="h-2 w-2 rounded-full bg-emerald-500 shrink-0" aria-hidden="true" />
+                        <span>
+                          {historyResult.logDeviceType}: <strong className="font-mono">{historyResult.logDeviceName}</strong>
+                        </span>
+                        <span className="text-slate-400">·</span>
+                        <span className="text-slate-600 dark:text-slate-300">
+                          {historyResult.rawPointCount.toLocaleString('de-DE')} Messpunkte
+                          {historyResult.downsampled ? ` (${historyResult.points.length} verdichtet)` : ''}
+                        </span>
+                      </span>
+                    ) : (
+                      <span className="flex items-center gap-1.5 text-amber-700 dark:text-amber-400">
+                        <span className="h-2 w-2 rounded-full bg-amber-500 shrink-0" aria-hidden="true" />
+                        <span>Vorschau-Verlauf</span>
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                {/* Manual Log Device Input Row */}
+                {sourcePreference === 'manual' && (
+                  <form
+                    onSubmit={handleApplyManualLog}
+                    className="flex flex-wrap items-center gap-2 rounded-2xl border theme-border bg-[var(--m3-canvas)] p-2.5"
+                  >
+                    <select
+                      value={manualLogTypeDraft}
+                      onChange={(e) => setManualLogTypeDraft(e.target.value as FhemLogDeviceType)}
+                      aria-label="Log-Gerätetyp"
+                      className="min-h-[36px] rounded-xl border theme-border bg-white px-2.5 text-xs font-semibold text-slate-800 dark:bg-[var(--m3-surface)] dark:text-slate-100"
+                    >
+                      <option value="DbLog">DbLog</option>
+                      <option value="FileLog">FileLog</option>
+                    </select>
+                    <input
+                      type="text"
+                      value={manualLogNameDraft}
+                      onChange={(e) => setManualLogNameDraft(e.target.value)}
+                      placeholder="FHEM-Gerätename (z. B. logdb oder FileLog_Temp_WZ)"
+                      className="min-h-[36px] flex-1 min-w-[180px] rounded-xl border theme-border bg-white px-3 font-mono text-xs text-slate-900 focus:border-[var(--accent-ring)] focus:outline-none dark:bg-[var(--m3-surface)] dark:text-slate-100"
+                    />
+                    <button
+                      type="submit"
+                      disabled={!manualLogNameDraft.trim() || loadingHistory}
+                      className="min-h-[36px] rounded-xl theme-btn-primary px-3.5 text-xs font-semibold disabled:opacity-45"
+                    >
+                      Abfragen
+                    </button>
+                  </form>
+                )}
+
+                {/* Transparent Fallback Notice (only shown when falling back to preview) */}
+                {!loadingHistory && historyResult?.notice && historyResult.source === 'simulated' && (
+                  <div className="flex items-center gap-2 rounded-xl bg-amber-500/10 px-3 py-2 text-[11px] text-amber-800 dark:text-amber-300">
+                    <Info className="h-3.5 w-3.5 shrink-0" />
+                    <span>{historyResult.notice}</span>
+                  </div>
+                )}
+              </div>
             </div>
 
             {/* KPI Summary Strip */}
@@ -686,7 +970,13 @@ export const ChartsView: React.FC<ChartsViewProps> = ({
                 )}
               </div>
 
-              <div className="h-[320px] sm:h-[360px] w-full">
+              <div className={`relative h-[320px] sm:h-[360px] w-full transition-opacity ${loadingHistory ? 'opacity-60' : 'opacity-100'}`}>
+                {loadingHistory && (
+                  <div className="pointer-events-none absolute right-2 top-2 z-10 flex items-center gap-1.5 rounded-xl border theme-border bg-[var(--m3-surface)]/95 px-2.5 py-1 text-[11px] font-medium text-slate-600 shadow-sm dark:text-slate-300">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    <span>Abfrage läuft…</span>
+                  </div>
+                )}
                 <ResponsiveContainer width="100%" height="100%">
                   {chartKind === 'bar' ? (
                     <BarChart data={seriesData} margin={{top: 12, right: effectiveDualClimate ? 8 : 12, left: -12, bottom: 4}}>

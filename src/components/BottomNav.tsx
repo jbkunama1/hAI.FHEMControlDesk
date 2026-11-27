@@ -7,12 +7,14 @@ import {
   DoorOpen,
   LayoutDashboard,
   LineChart,
+  Monitor,
   Moon,
   Settings,
+  Smartphone,
   Sparkles,
   Sun,
 } from 'lucide-react';
-import type {ActiveTab, ColorThemeId} from '../types/fhem';
+import type {ActiveTab, ColorThemeId, ViewMode} from '../types/fhem';
 import {COLOR_THEMES} from '../lib/themes';
 
 export interface SidebarRoomItem {
@@ -34,8 +36,10 @@ interface NavProps {
   chartableCount: number;
   theme: 'dark' | 'light';
   colorTheme: ColorThemeId;
+  viewMode: ViewMode;
   onToggleTheme: () => void;
   onSelectColorTheme: (id: ColorThemeId) => void;
+  onChangeViewMode: (mode: ViewMode) => void;
 }
 
 const DESKTOP_NAV_ITEMS: Array<{
@@ -52,18 +56,6 @@ const DESKTOP_NAV_ITEMS: Array<{
   {id: 'settings', label: 'Einstellungen', icon: Settings},
 ];
 
-const MOBILE_NAV_ITEMS: Array<{
-  id: ActiveTab;
-  label: string;
-  icon: React.ComponentType<{className?: string}>;
-}> = [
-  {id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard},
-  {id: 'rooms', label: 'Räume', icon: DoorOpen},
-  {id: 'devices', label: 'Geräte', icon: Cpu},
-  {id: 'assistant', label: 'KI-Hilfe', icon: Sparkles},
-  {id: 'settings', label: 'Setup', icon: Settings},
-];
-
 export const BottomNav: React.FC<NavProps> = ({
   activeTab,
   selectedRoom,
@@ -76,16 +68,16 @@ export const BottomNav: React.FC<NavProps> = ({
   chartableCount,
   theme,
   colorTheme,
+  viewMode,
   onToggleTheme,
   onSelectColorTheme,
+  onChangeViewMode,
 }) => {
   const [roomsExpanded, setRoomsExpanded] = useState(true);
 
   return (
-    <>
-      {/* Desktop Material 3 Navigation Rail / Sidebar */}
-      <aside className="hidden lg:flex lg:fixed lg:inset-y-0 lg:left-0 lg:z-40 lg:w-64 lg:flex-col border-r theme-surface">
-        <div className="flex h-14 shrink-0 items-center gap-3 px-5 border-b theme-border">
+    <aside className="fixed inset-y-0 left-0 z-40 flex w-64 flex-col border-r theme-surface">
+      <div className="flex h-14 shrink-0 items-center gap-3 px-5 border-b theme-border">
           <img
             src="/icon.svg"
             alt="FHEM Control Desk"
@@ -224,10 +216,40 @@ export const BottomNav: React.FC<NavProps> = ({
             </div>
           </div>
 
+          {/* Device View Mode Switcher */}
+          <div className="grid grid-cols-3 gap-1 rounded-xl border theme-border bg-[var(--m3-canvas)] p-0.5">
+            {(
+              [
+                {id: 'auto', label: 'Auto', icon: Monitor},
+                {id: 'mobile', label: 'Mobil', icon: Smartphone},
+                {id: 'desktop', label: 'Desktop', icon: Monitor},
+              ] as const
+            ).map((opt) => {
+              const Icon = opt.icon;
+              const active = viewMode === opt.id;
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => onChangeViewMode(opt.id)}
+                  title={`Ansicht: ${opt.label}`}
+                  className={`flex min-h-[32px] items-center justify-center gap-1 rounded-lg text-[11px] font-semibold transition-colors ${
+                    active
+                      ? 'theme-tonal'
+                      : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200'
+                  }`}
+                >
+                  <Icon className="h-3 w-3 shrink-0" />
+                  <span>{opt.label}</span>
+                </button>
+              );
+            })}
+          </div>
+
           <button
             type="button"
             onClick={onToggleTheme}
-            className="flex min-h-[44px] w-full items-center justify-between rounded-2xl theme-surface-alt px-4 text-sm font-medium text-slate-700 transition-colors hover:opacity-90 dark:text-slate-200"
+            className="flex min-h-[42px] w-full items-center justify-between rounded-2xl theme-surface-alt px-4 text-sm font-medium text-slate-700 transition-colors hover:opacity-90 dark:text-slate-200"
           >
             <span className="flex items-center gap-2.5">
               {theme === 'dark' ? <Moon className="h-4 w-4 theme-text" /> : <Sun className="h-4 w-4 text-amber-500" />}
@@ -237,48 +259,5 @@ export const BottomNav: React.FC<NavProps> = ({
           </button>
         </div>
       </aside>
-
-      {/* Mobile Material Design 3 Bottom Navigation Bar */}
-      <nav
-        aria-label="Mobile Navigation"
-        className="fixed bottom-0 left-0 right-0 z-40 border-t theme-border bg-[var(--m3-surface)]/95 backdrop-blur-md lg:hidden pb-safe"
-      >
-        <div className="grid h-16 grid-cols-5 items-center px-1">
-          {MOBILE_NAV_ITEMS.map((item) => {
-            const Icon = item.icon;
-            const active = activeTab === item.id;
-            return (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => onSelectTab(item.id)}
-                className="flex min-h-[48px] flex-col items-center justify-center gap-1 focus-visible:outline-none"
-              >
-                <span
-                  className={`relative flex h-8 w-12 items-center justify-center rounded-full transition-colors ${
-                    active ? 'theme-tonal' : 'text-slate-500 dark:text-slate-400'
-                  }`}
-                >
-                  <Icon className="h-5 w-5" />
-                  {item.id === 'devices' && errorCount > 0 && (
-                    <span
-                      className="absolute right-2.5 top-1 h-2 w-2 rounded-full bg-red-500"
-                      aria-label={`${errorCount} Fehler`}
-                    />
-                  )}
-                </span>
-                <span
-                  className={`text-[11px] leading-none whitespace-nowrap ${
-                    active ? 'font-semibold theme-text' : 'font-medium text-slate-500 dark:text-slate-400'
-                  }`}
-                >
-                  {item.label}
-                </span>
-              </button>
-            );
-          })}
-        </div>
-      </nav>
-    </>
   );
 };

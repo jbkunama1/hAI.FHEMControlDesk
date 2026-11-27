@@ -4,6 +4,7 @@ import {
   extractFhemCommandsFromReply,
   runLocalFhemAssistantFallback,
 } from './fhemCommandref';
+import {getActiveSessionToken} from './profileClient';
 
 export interface AiProviderPreset {
   id: string;
@@ -169,11 +170,13 @@ async function callOpenAiCompatible(
 
   // Server-side proxy (/api/ai/chat) for cloud OpenAI-compatible APIs
   try {
+    const sessionToken = getActiveSessionToken();
     const response = await fetch('/api/ai/chat', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-Requested-With': 'FHEM-Control-Desk',
+        ...(sessionToken ? {'X-Session-Token': sessionToken} : {}),
       },
       body: JSON.stringify({
         baseUrl: config.baseUrl.trim(),

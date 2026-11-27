@@ -22,6 +22,7 @@ function makeRawDevice(params: {
   possibleSets?: string;
   readings?: Record<string, string>;
   extraAttrs?: Record<string, string>;
+  extraInternals?: Record<string, string>;
   minutesAgo?: number;
 }): FhemRawDevice {
   const ts = formatFhemTime(params.minutesAgo ?? 3);
@@ -56,10 +57,76 @@ function makeRawDevice(params: {
       DEF: params.def,
       STATE: params.state,
       NR: String(Math.floor(Math.random() * 400) + 10),
+      ...(params.extraInternals || {}),
     },
     Readings: readingsObj,
     Attributes: attributes,
   };
+}
+
+export function createSeedLogDevices(): FhemRawDevice[] {
+  const year = new Date().getFullYear();
+  return [
+    makeRawDevice({
+      name: 'logdb',
+      type: 'DbLog',
+      def: './db.conf .*:.*',
+      alias: 'FHEM Datenbank-Logger (DbLog)',
+      room: 'System,Technik',
+      state: 'connected',
+      group: 'Logging',
+      possibleSets: 'reopen commitCache',
+      readings: {
+        state: 'connected',
+        DbLogType: 'Current/History',
+      },
+      extraAttrs: {
+        DbLogSelectionMode: 'Exclude/Include',
+        asyncMode: '1',
+      },
+      extraInternals: {
+        REGEXP: '.*:.*',
+        MODEL: 'SQLITE',
+      },
+      minutesAgo: 1,
+    }),
+    makeRawDevice({
+      name: 'FileLog_Klima',
+      type: 'FileLog',
+      def: `./log/Klima-%Y.log .*(Sensor|Thermostat|Klima).*:.*`,
+      alias: 'FileLog Raumklima & Thermostate',
+      room: 'System,Technik',
+      state: 'active',
+      group: 'Logging',
+      possibleSets: 'reopen clear',
+      readings: {
+        state: 'active',
+      },
+      extraInternals: {
+        REGEXP: '.*(Sensor|Thermostat|Klima).*:.*',
+        currentlogfile: `./log/Klima-${year}.log`,
+      },
+      minutesAgo: 2,
+    }),
+    makeRawDevice({
+      name: 'FileLog_Energie',
+      type: 'FileLog',
+      def: `./log/Energie-%Y.log .*Plug.*:.*`,
+      alias: 'FileLog Energie & Steckdosen',
+      room: 'System,Technik',
+      state: 'active',
+      group: 'Logging',
+      possibleSets: 'reopen clear',
+      readings: {
+        state: 'active',
+      },
+      extraInternals: {
+        REGEXP: '.*Plug.*:.*',
+        currentlogfile: `./log/Energie-${year}.log`,
+      },
+      minutesAgo: 2,
+    }),
+  ];
 }
 
 export function createInitialFhemDevices(): FhemRawDevice[] {
@@ -354,8 +421,10 @@ export function createInitialFhemDevices(): FhemRawDevice[] {
       readings: {
         cpu_temp: '44.2',
         loadavg: '0.18 0.22 0.19',
+        stat_cpu_percent: '12.4 0.3 4.8 82.5',
         ram: 'Total: 7942 MB, Used: 1412 MB (17.8%)',
         uptime_text: '42 Tage, 11 Std, 28 Min',
+        fhemuptime_text: '14 Tage, 6 Std, 12 Min',
       },
       minutesAgo: 1,
     }),
@@ -1185,6 +1254,7 @@ export function createInitialFhemDevices(): FhemRawDevice[] {
   ];
 
   list.push(...automations);
+  list.push(...createSeedLogDevices());
   return list;
 }
 

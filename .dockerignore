@@ -6,5 +6,6 @@ server.mjs
 .env
 .env.*
 !.env.example
+data/
 *.log
 .DS_Store

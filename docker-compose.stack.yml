@@ -1,0 +1,106 @@
+# ==============================================================================
+# FHEM Control Desk – Komplett-Stack (Neuer FHEM-Server + Exklusive WebUI)
+# ==============================================================================
+# Starten mit:
+#   cp .env.example .env
+#   docker compose -f docker-compose.stack.yml up -d --build
+#
+# Architektur-Vorteil ("Exklusive WebUI"):
+# - Der klassische FHEMWEB-Port 8083 wird NICHT nach außen veröffentlicht!
+# - FHEM und FHEM Control Desk sprechen ausschließlich über das interne
+#   Docker-Netzwerk "fhem_internal" (http://fhem:8083/fhem).
+# - Alle Benutzer melden sich direkt an FHEM Control Desk (Port 3000 bzw.
+#   über deinen HTTPS-Reverse-Proxy) an und sehen sofort ihre echten Geräte –
+#   ohne manuelle Server-Konfiguration und ohne Test-Instanz.
+# ==============================================================================
+
+services:
+  fhem:
+    image: fhem/fhem:latest
+    container_name: fhem-server
+    restart: unless-stopped
+    environment:
+      TZ: "${TZ:-Europe/Berlin}"
+      FHEM_UID: "${FHEM_UID:-6061}"
+      FHEM_GID: "${FHEM_GID:-6061}"
+    volumes:
+      - fhem_server_data:/opt/fhem
+    # Optional: USB-Sticks (ZigBee-Coordinator, CUL, Homematic) durchreichen:
+    # devices:
+    #   - "/dev/serial/by-id/usb-DEIN-STICK:/dev/ttyACM0"
+    #
+    # Hinweis: Port 8083 bleibt absichtlich NICHT nach außen gemappt, damit
+    # FHEM Control Desk die exklusive WebUI ist. Nur für Notfall-Debugging
+    # lokal auf 127.0.0.1 öffnen:
+    # ports:
+    #   - "127.0.0.1:8083:8083"
+    networks:
+      - fhem_internal
+
+  fhem-control-desk:
+    build: .
+    container_name: fhem-control-desk
+    restart: unless-stopped
+    depends_on:
+      - fhem
+    ports:
+      # Hinter einem Reverse Proxy auf demselben Host am besten auf "127.0.0.1:3000:3000" einschränken:
+      - "${APP_PORT_BIND:-3000}:3000"
+    volumes:
+      - fhem_desk_data:/app/data
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATA_DIR: /app/data
+      TZ: "${TZ:-Europe/Berlin}"
+
+      # Fester interner FHEM-Upstream + Exklusiv-Modus (deaktiviert Test-Instanz & Fremd-Ziele):
+      FHEM_UPSTREAM_URL: "${FHEM_UPSTREAM_URL:-http://fhem:8083/fhem}"
+      FHEM_EXCLUSIVE_MODE: "${FHEM_EXCLUSIVE_MODE:-true}"
+      FHEM_UPSTREAM_CSRF_MODE: "${FHEM_UPSTREAM_CSRF_MODE:-auto}"
+      FHEM_UPSTREAM_METHOD: "${FHEM_UPSTREAM_METHOD:-GET}"
+      FHEM_UPSTREAM_AUTH_TYPE: "${FHEM_UPSTREAM_AUTH_TYPE:-none}"
+      FHEM_UPSTREAM_USER: "${FHEM_UPSTREAM_USER:-}"
+      FHEM_UPSTREAM_PASS: "${FHEM_UPSTREAM_PASS:-}"
+      FHEM_UPSTREAM_API_KEY: "${FHEM_UPSTREAM_API_KEY:-}"
+
+      # Internet-Sicherheit & Benutzerkonten:
+      REQUIRE_LOGIN: "${REQUIRE_LOGIN:-true}"
+      ADMIN_BOOTSTRAP_TOKEN: "${ADMIN_BOOTSTRAP_TOKEN:-}"
+      APP_AUTH_USER: "${APP_AUTH_USER:-}"
+      APP_AUTH_PASS: "${APP_AUTH_PASS:-}"
+
+      # Optional: KI-Assistent
+      AI_BASE_URL: "${AI_BASE_URL:-}"
+      AI_API_KEY: "${AI_API_KEY:-}"
+      AI_MODEL: "${AI_MODEL:-}"
+      AI_ALLOWED_HOSTS: "${AI_ALLOWED_HOSTS:-}"
+    networks:
+      - fhem_internal
+
+  # Optional: Automatischer HTTPS-Reverse-Proxy mit Caddy (einkommentieren & Caddyfile anlegen)
+  # caddy:
+  #   image: caddy:2-alpine
+  #   container_name: fhem-caddy
+  #   restart: unless-stopped
+  #   depends_on:
+  #     - fhem-control-desk
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./Caddyfile:/etc/caddy/Caddyfile:ro
+  #     - caddy_data:/data
+  #     - caddy_config:/config
+  #   networks:
+  #     - fhem_internal
+
+networks:
+  fhem_internal:
+    driver: bridge
+
+volumes:
+  fhem_server_data:
+  fhem_desk_data:
+  # caddy_data:
+  # caddy_config:

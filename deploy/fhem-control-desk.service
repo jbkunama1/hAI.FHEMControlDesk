@@ -1,0 +1,47 @@
+# ==============================================================================
+# systemd Unit – FHEM Control Desk auf einem bestehenden Linux/Raspberry-Pi-Host
+# ==============================================================================
+# Ideal, wenn FHEM bereits nativ auf demselben Raspberry Pi / Debian-Server läuft
+# und du KEIN Docker verwenden möchtest.
+#
+# Installation:
+#   1. Projekt nach /opt/fhem-control-desk kopieren & bauen:
+#        cd /opt/fhem-control-desk
+#        npm ci && npm run build
+#        npx esbuild server.ts --bundle --platform=node --format=esm --packages=external --outfile=server.mjs
+#   2. .env anlegen (mit FHEM_UPSTREAM_URL=http://127.0.0.1:8083/fhem und FHEM_EXCLUSIVE_MODE=true)
+#   3. Rechte setzen:
+#        sudo mkdir -p /var/lib/fhem-control-desk
+#        sudo chown -R fhem:dialout /var/lib/fhem-control-desk
+#        sudo chmod 700 /var/lib/fhem-control-desk
+#   4. Service installieren & starten:
+#        sudo cp deploy/fhem-control-desk.service /etc/systemd/system/
+#        sudo systemctl daemon-reload
+#        sudo systemctl enable --now fhem-control-desk
+# ==============================================================================
+
+[Unit]
+Description=FHEM Control Desk – Exklusive Smart-Home WebUI
+After=network-online.target fhem.service
+Wants=network-online.target fhem.service
+
+[Service]
+Type=simple
+User=fhem
+Group=dialout
+WorkingDirectory=/opt/fhem-control-desk
+EnvironmentFile=/opt/fhem-control-desk/.env
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=HOST=0.0.0.0
+Environment=DATA_DIR=/var/lib/fhem-control-desk
+ExecStart=/usr/bin/node /opt/fhem-control-desk/server.mjs
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/fhem-control-desk
+
+[Install]
+WantedBy=multi-user.target
