@@ -66,14 +66,12 @@ services:
       AI_MODEL: "${AI_MODEL:-}"
       AI_ALLOWED_HOSTS: "${AI_ALLOWED_HOSTS:-}"
 
-    # Optional: Mit einem bereits existierenden FHEM-Docker-Netzwerk verbinden:
-    # networks:
-    #   - existing_fhem_net
+    networks:
+      - highfishNetwork
 
 volumes:
   fhem_desk_data:
 
-# networks:
-#   existing_fhem_net:
-#     external: true
-#     name: fhem_default
+networks:
+  highfishNetwork:
+    external: true

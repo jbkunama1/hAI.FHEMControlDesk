@@ -59,14 +59,12 @@ services:
       FHEM_HEALTH_PORT: "${FHEM_HEALTH_PORT:-8083}"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
 
-    # Optional: Mit einem bereits existierenden FHEM-Docker-Netzwerk verbinden:
-    # networks:
-    #   - existing_fhem_net
+    networks:
+      - highfishNetwork
 
 volumes:
   fhem_desk_data:
 
-# networks:
-#   existing_fhem_net:
-#     external: true
-#     name: fhem_default
+networks:
+  highfishNetwork:
+    external: true
