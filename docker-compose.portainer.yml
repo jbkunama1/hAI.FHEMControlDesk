@@ -6,7 +6,8 @@ services:
     container_name: fhem-control-desk
     restart: unless-stopped
     ports:
-      - "${HOST_PORT:-3000}:3000"
+      # Äußerer Host-Port über PORT oder HOST_PORT steuerbar (intern bleibt der Container auf 3000)
+      - "${HOST_PORT:-${PORT:-3000}}:3000"
     extra_hosts:
       # Ermöglicht Zugriff auf natives FHEM auf demselben Linux-Host via "host.docker.internal"
       - "host.docker.internal:host-gateway"

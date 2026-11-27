@@ -47,8 +47,8 @@ services:
     depends_on:
       - fhem
     ports:
-      # Hinter einem Reverse Proxy auf demselben Host am besten auf "127.0.0.1:3000:3000" einschränken:
-      - "${APP_PORT_BIND:-3000}:3000"
+      # Äußerer Port über PORT, HOST_PORT oder APP_PORT_BIND (z. B. 127.0.0.1:8085) steuerbar
+      - "${APP_PORT_BIND:-${HOST_PORT:-${PORT:-3000}}}:3000"
     volumes:
       - fhem_desk_data:/app/data
     environment:
