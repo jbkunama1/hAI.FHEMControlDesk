@@ -17,7 +17,7 @@
 
 services:
   fhem:
-    image: fhem/fhem:latest
+    image: "${FHEM_IMAGE:-fhem/fhem:bookworm}"
     container_name: fhem-server
     restart: unless-stopped
     environment:
