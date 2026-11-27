@@ -1,0 +1,20 @@
+# Portainer-Stack: fertiges Image aus ghcr.io (kein Build nötig)
+# Stacks -> Add stack -> Web editor, Inhalt einfügen, Variablen unter "Environment variables" setzen.
+services:
+  fhem-control-desk:
+    image: ghcr.io/jbkunama1/hai.fhemcontroldesk:latest
+    container_name: fhem-control-desk
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-3000}:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      FHEM_ALLOWED_HOSTS: ${FHEM_ALLOWED_HOSTS:-192.168.178.50}
+      FHEM_HEALTH_HOST: ${FHEM_HEALTH_HOST:-}
+      FHEM_HEALTH_PORT: ${FHEM_HEALTH_PORT:-8083}
+      AI_ALLOWED_HOSTS: ${AI_ALLOWED_HOSTS:-}
+      AI_BASE_URL: ${AI_BASE_URL:-}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_MODEL: ${AI_MODEL:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
