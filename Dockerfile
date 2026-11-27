@@ -1,10 +1,10 @@
 # Multi-stage production Dockerfile for FHEM Control Desk (amd64 & arm64 / Raspberry Pi)
-FROM node:22-alpine AS builder
+FROM --platform=$BUILDPLATFORM node:22-alpine AS builder
 
 WORKDIR /app
 
 COPY package.json ./
-RUN npm install
+RUN npm install --no-audit --no-fund
 
 COPY . .
 
@@ -22,7 +22,7 @@ ENV HOST=0.0.0.0
 ENV DATA_DIR=/app/data
 
 COPY package.json ./
-RUN npm install --omit=dev && npm cache clean --force
+RUN npm install --omit=dev --no-audit --no-fund && npm cache clean --force
 
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/server.mjs ./server.mjs

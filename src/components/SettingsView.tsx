@@ -1,6 +1,7 @@
 import React, {useEffect, useMemo, useState} from 'react';
 import {
   AlertTriangle,
+  Archive,
   Check,
   CheckCircle2,
   Copy,
@@ -51,6 +52,7 @@ import type {
 } from '../types/fhem';
 import {buildFhemEndpointUrl} from '../lib/fhemClient';
 import {resolveRoomImage} from '../lib/roomVisuals';
+import {BackupsSection} from './BackupsSection';
 import {PWAInstallButton} from './PWAInstallButton';
 import {ProfileAdminSection} from './ProfileAdminSection';
 import {SmartVisualImage} from './SmartVisualImage';
@@ -104,7 +106,7 @@ interface SettingsViewProps {
   onRefreshAuthStatus: () => Promise<void>;
 }
 
-export type SettingsSection = 'connection' | 'profile' | 'admin' | 'logs' | 'app';
+export type SettingsSection = 'connection' | 'profile' | 'admin' | 'backups' | 'logs' | 'app';
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
   config,
@@ -343,12 +345,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       </div>
 
       {/* Section Tabs */}
-      <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5 rounded-2xl border theme-surface p-1.5">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-1.5 rounded-2xl border theme-surface p-1.5">
         {(
           [
             {id: 'connection', label: 'Server & Tresor', icon: Server},
             {id: 'profile', label: 'Profil & Benutzer', icon: Users},
             {id: 'admin', label: 'Server-Admin', icon: Terminal},
+            {id: 'backups', label: 'Backups', icon: Archive},
             {id: 'logs', label: 'Events & Logfile', icon: FileText},
             {id: 'app', label: 'Design & Bilder', icon: Sun},
           ] as const
@@ -1404,6 +1407,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </pre>
           </div>
         </div>
+      )}
+
+      {/* SECTION 2b: BACKUPS */}
+      {section === 'backups' && (
+        <BackupsSection
+          config={config}
+          unsavedChanges={status.unsavedChanges}
+          isLocalMode={config.mode === 'local_instance'}
+          onExecuteCommand={onExecuteConsoleCommand}
+          onAfterSaveConfig={() => void onReloadLogs()}
+        />
       )}
 
       {/* SECTION 3: EVENT MONITOR & LOGFILE */}

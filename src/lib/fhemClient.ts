@@ -856,11 +856,115 @@ export function extractSchedulesFromDevices(devices: FhemDevice[]): ScheduleEntr
 // Stateful Local FHEM Protocol Engine (executes authentic FHEMWEB commands)
 // ============================================================================
 
+export interface FhemServerBackupItem {
+  filename: string;
+  sizeBytes: number;
+  mtimeSec: number;
+  fullPath: string;
+}
+
+export interface FhemBackupListResult {
+  directory: string;
+  backups: FhemServerBackupItem[];
+  errorHint?: string;
+}
+
+export function isSafeBackupFilename(value: string): boolean {
+  const trimmed = (value || '').trim();
+  if (!trimmed || trimmed.length > 170) return false;
+  if (trimmed.startsWith('.') || trimmed.includes('..')) return false;
+  return /^[A-Za-z0-9._-]{1,160}\.(tar\.gz|tgz|tar|zip|gz)$/i.test(trimmed);
+}
+
+// Pure read-only Perl expression (zero shell invocation) respecting attr global backupdir
+export const FHEM_LIST_BACKUPS_CMD =
+  '{ my $d = AttrVal("global","backupdir","./backup"); opendir(my $dh,$d) or return "ERR_DIR:$d:$!"; my @f = sort { (stat("$d/$b"))[9] <=> (stat("$d/$a"))[9] } grep { /\\.(tar\\.gz|tgz|tar|zip|gz)$/i && -f "$d/$_" } readdir($dh); closedir($dh); return "DIR:$d\\n" . join("\\n", map { my @s = stat("$d/$_"); join("|", $_, $s[7]||0, $s[9]||0) } splice(@f, 0, 25)); }';
+
+export function parseFhemBackupListOutput(raw: string): FhemBackupListResult {
+  const trimmed = (raw || '').trim();
+  if (!trimmed) {
+    return {directory: './backup', backups: []};
+  }
+  if (trimmed.startsWith('ERR_DIR:')) {
+    const rest = trimmed.slice('ERR_DIR:'.length);
+    const colonIdx = rest.indexOf(':');
+    const dir = colonIdx >= 0 ? rest.slice(0, colonIdx) : './backup';
+    const reason = colonIdx >= 0 ? rest.slice(colonIdx + 1).trim() : 'Verzeichnis nicht lesbar';
+    return {
+      directory: dir || './backup',
+      backups: [],
+      errorHint: `Backup-Verzeichnis „${dir || './backup'}“ konnte nicht gelesen werden (${reason}). Wird beim ersten FHEM-Backup automatisch angelegt.`,
+    };
+  }
+  if (/unknown command|forbidden|not allowed|syntax error/i.test(trimmed) && !trimmed.includes('DIR:')) {
+    return {
+      directory: './backup',
+      backups: [],
+      errorHint:
+        'Der FHEM-Server blockiert Perl-Ausdrücke zum Auslesen des Backup-Verzeichnisses (z. B. über allowedCommands). Neue Backups können trotzdem per „backup“-Befehl angefordert werden.',
+    };
+  }
+
+  const lines = trimmed.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  let directory = './backup';
+  const backups: FhemServerBackupItem[] = [];
+
+  for (const line of lines) {
+    if (line.startsWith('DIR:')) {
+      const parsedDir = line.slice(4).trim();
+      if (parsedDir) directory = parsedDir;
+      continue;
+    }
+    const parts = line.split('|');
+    if (parts.length >= 3) {
+      const filename = parts[0].trim();
+      const sizeBytes = Number(parts[1]) || 0;
+      const mtimeSec = Number(parts[2]) || 0;
+      if (filename && !filename.includes('..') && !filename.includes('/')) {
+        const cleanDir = directory.replace(/\/+$/, '');
+        backups.push({
+          filename,
+          sizeBytes: Math.max(0, sizeBytes),
+          mtimeSec: Math.max(0, mtimeSec),
+          fullPath: `${cleanDir}/${filename}`,
+        });
+      }
+    }
+  }
+
+  backups.sort((a, b) => b.mtimeSec - a.mtimeSec || b.filename.localeCompare(a.filename));
+  return {directory, backups};
+}
+
+interface SandboxBackupEntry {
+  filename: string;
+  sizeBytes: number;
+  mtimeSec: number;
+}
+
+function createInitialSandboxBackups(): SandboxBackupEntry[] {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const makeEntry = (offsetSec: number, sizeBytes: number): SandboxBackupEntry => {
+    const mtimeSec = nowSec - offsetSec;
+    const d = new Date(mtimeSec * 1000);
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const filename = `FHEM-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.tar.gz`;
+    return {filename, sizeBytes, mtimeSec};
+  };
+  return [
+    makeEntry(6 * 3600 + 420, 16_428_544),
+    makeEntry(3 * 86400 + 1800, 16_190_208),
+    makeEntry(7 * 86400 + 3600, 15_842_304),
+    makeEntry(14 * 86400 + 900, 15_410_176),
+  ];
+}
+
 interface SandboxState {
   devices: FhemRawDevice[];
   events: FhemEventItem[];
   logs: FhemLogEntry[];
   unsavedChanges: boolean;
+  backups?: SandboxBackupEntry[];
 }
 
 class LocalFhemEngine {
@@ -932,6 +1036,9 @@ class LocalFhemEngine {
           sysmonDev.Readings.fhemuptime_text = {Value: '14 Tage, 6 Std, 12 Min', Time: ts};
         }
       }
+      if (!Array.isArray(saved.backups)) {
+        saved.backups = createInitialSandboxBackups();
+      }
       this.state = saved;
     } else {
       this.state = {
@@ -939,10 +1046,45 @@ class LocalFhemEngine {
         events: createInitialEvents(),
         logs: createInitialLogs(),
         unsavedChanges: false,
+        backups: createInitialSandboxBackups(),
       };
     }
     this.initialized = true;
     return this.state;
+  }
+
+  async buildSandboxConfigDump(filename: string): Promise<{fhemCfg: string; manifest: string}> {
+    const state = await this.ensureLoaded();
+    const lines: string[] = [
+      '# FHEM Control Desk – Exportierte Konfiguration (Lokale Test-Instanz)',
+      `# Archiv: ${filename}`,
+      `# Erstellt: ${new Date().toISOString()}`,
+      `# Geräte: ${state.devices.length}`,
+      '',
+      'attr global userattr cmdIcon devStateIcon devStateStyle icon sortby webCmd widgetOverride',
+      'attr global backupdir ./backup',
+      'attr global backup_before_update 1',
+      '',
+    ];
+    for (const dev of state.devices) {
+      const def = dev.Internals.DEF ? ` ${dev.Internals.DEF}` : '';
+      lines.push(`define ${dev.Name} ${dev.Internals.TYPE}${def}`);
+      for (const [attrKey, attrVal] of Object.entries(dev.Attributes)) {
+        if (attrVal !== undefined && attrVal !== '') {
+          lines.push(`attr ${dev.Name} ${attrKey} ${attrVal}`);
+        }
+      }
+      lines.push('');
+    }
+    const manifest = [
+      `FHEM Backup Archive: ${filename}`,
+      `Mode: Local FHEM Control Desk Test Instance`,
+      `Devices: ${state.devices.length}`,
+      `Logs: ${state.logs.length}`,
+      `ExportedAt: ${new Date().toISOString()}`,
+      '',
+    ].join('\n');
+    return {fhemCfg: lines.join('\n'), manifest};
   }
 
   async triggerLiveSimulationTick(): Promise<void> {
@@ -1217,6 +1359,47 @@ class LocalFhemEngine {
       if (evaluated !== null) {
         return {ok: true, data: evaluated, latencyMs: latency, statusCode: 200, requestUrlPreview: preview};
       }
+    }
+
+    // Safe read-only backup directory listing (matches FHEM_LIST_BACKUPS_CMD)
+    if (trimmed.startsWith('{') && trimmed.endsWith('}') && trimmed.includes('backupdir') && trimmed.includes('opendir')) {
+      const backups = Array.isArray(state.backups) ? state.backups : createInitialSandboxBackups();
+      state.backups = backups;
+      const lines = [
+        'DIR:./backup',
+        ...backups
+          .slice()
+          .sort((a, b) => b.mtimeSec - a.mtimeSec)
+          .slice(0, 25)
+          .map((b) => `${b.filename}|${b.sizeBytes}|${b.mtimeSec}`),
+      ];
+      return {ok: true, data: lines.join('\n'), latencyMs: latency, statusCode: 200, requestUrlPreview: preview};
+    }
+
+    // backup [symlink]
+    if (trimmed === 'backup' || trimmed === 'backup symlink') {
+      const now = new Date();
+      const pad = (n: number) => String(n).padStart(2, '0');
+      const filename = `FHEM-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.tar.gz`;
+      const sizeBytes = 16_200_000 + Math.round(Math.random() * 1_150_000);
+      const entry: SandboxBackupEntry = {
+        filename,
+        sizeBytes,
+        mtimeSec: Math.floor(now.getTime() / 1000),
+      };
+      const existing = Array.isArray(state.backups) ? state.backups : createInitialSandboxBackups();
+      state.backups = [entry, ...existing.filter((b) => b.filename !== filename)].slice(0, 25);
+      const sizeMb = (sizeBytes / (1024 * 1024)).toFixed(2);
+      this.pushLog(state, 3, 'FHEM', `Backup erfolgreich erstellt: ./backup/${filename} (${sizeMb} MB)`);
+      this.pushEvent(state, 'global', 'Global', `BACKUP ${filename}`, 'info');
+      await saveSandboxSnapshot(state);
+      return {
+        ok: true,
+        data: `Backup mit Befehl tar -czf ./backup/${filename} abgeschlossen (${sizeMb} MB).`,
+        latencyMs: latency,
+        statusCode: 200,
+        requestUrlPreview: preview,
+      };
     }
 
     // save
@@ -2503,4 +2686,227 @@ export function startFhemLongpoll(
   void connect();
   return {stop};
 }
+
+// ============================================================================
+// FHEM Backup Archive Download (Direct Server Proxy, Direct LAN & Local Sandbox)
+// ============================================================================
+
+export interface BackupDownloadResult {
+  ok: boolean;
+  sizeBytes?: number;
+  errorMessage?: string;
+}
+
+function buildUstarTarBytes(files: Array<{name: string; content: string}>): Uint8Array {
+  const encoder = new TextEncoder();
+  const blocks: Uint8Array[] = [];
+  const mtimeOctal = Math.floor(Date.now() / 1000).toString(8).padStart(11, '0');
+
+  const writeAscii = (buf: Uint8Array, offset: number, str: string, maxLen: number) => {
+    const bytes = encoder.encode(str);
+    const len = Math.min(bytes.length, maxLen);
+    for (let i = 0; i < len; i++) {
+      buf[offset + i] = bytes[i];
+    }
+  };
+
+  for (const file of files) {
+    const data = encoder.encode(file.content);
+    const header = new Uint8Array(512);
+    writeAscii(header, 0, file.name, 100);
+    writeAscii(header, 100, '0000644\0', 8);
+    writeAscii(header, 108, '0000000\0', 8);
+    writeAscii(header, 116, '0000000\0', 8);
+    writeAscii(header, 124, `${data.byteLength.toString(8).padStart(11, '0')}\0`, 12);
+    writeAscii(header, 136, `${mtimeOctal}\0`, 12);
+    // Checksum field filled with spaces before calculation
+    for (let i = 148; i < 156; i++) header[i] = 0x20;
+    header[156] = 0x30; // '0' regular file
+    writeAscii(header, 257, 'ustar\0', 6);
+    writeAscii(header, 263, '00', 2);
+    writeAscii(header, 265, 'fhem', 32);
+    writeAscii(header, 297, 'fhem', 32);
+
+    let checksum = 0;
+    for (let i = 0; i < 512; i++) checksum += header[i];
+    writeAscii(header, 148, `${checksum.toString(8).padStart(6, '0')}\0 `, 8);
+
+    blocks.push(header);
+    blocks.push(data);
+    const padLen = (512 - (data.byteLength % 512)) % 512;
+    if (padLen > 0) {
+      blocks.push(new Uint8Array(padLen));
+    }
+  }
+
+  // Two 512-byte zero blocks terminate a POSIX tar archive
+  blocks.push(new Uint8Array(1024));
+
+  const totalLen = blocks.reduce((sum, b) => sum + b.byteLength, 0);
+  const out = new Uint8Array(totalLen);
+  let pos = 0;
+  for (const b of blocks) {
+    out.set(b, pos);
+    pos += b.byteLength;
+  }
+  return out;
+}
+
+async function createTarGzBlob(files: Array<{name: string; content: string}>): Promise<Blob> {
+  const tarBytes = buildUstarTarBytes(files);
+  if (typeof CompressionStream !== 'undefined') {
+    const cs = new CompressionStream('gzip');
+    const writer = cs.writable.getWriter();
+    await writer.write(tarBytes as unknown as BufferSource);
+    await writer.close();
+    const gzBuffer = await new Response(cs.readable).arrayBuffer();
+    return new Blob([gzBuffer], {type: 'application/gzip'});
+  }
+  return new Blob([tarBytes as unknown as BlobPart], {type: 'application/x-tar'});
+}
+
+function triggerBrowserFileDownload(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.rel = 'noopener';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
+function decodeBase64ToUint8Array(base64: string): Uint8Array {
+  const cleaned = base64.replace(/\s+/g, '');
+  const binary = atob(cleaned);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+export async function downloadFhemBackup(
+  config: FhemConnectionConfig,
+  filename: string
+): Promise<BackupDownloadResult> {
+  const cleanName = (filename || '').trim();
+  if (!isSafeBackupFilename(cleanName)) {
+    return {
+      ok: false,
+      errorMessage: 'Ungültiger Backup-Dateiname.',
+    };
+  }
+
+  // 1. Local Built-in Test Instance: generate a genuine extractable .tar.gz with sandbox fhem.cfg
+  if (config.mode === 'local_instance' && !config.useServerUpstream) {
+    const {fhemCfg, manifest} = await localFhemEngine.buildSandboxConfigDump(cleanName);
+    const blob = await createTarGzBlob([
+      {name: 'fhem.cfg', content: fhemCfg},
+      {name: 'backup-info.txt', content: manifest},
+    ]);
+    triggerBrowserFileDownload(blob, cleanName);
+    return {ok: true, sizeBytes: blob.size};
+  }
+
+  // 2. Direct LAN Mode (browser speaks directly to FHEMWEB without backend proxy)
+  if (!config.useServerUpstream && config.transport === 'direct') {
+    const perlCmd = `{ require MIME::Base64; my $d = AttrVal("global","backupdir","./backup"); my $f = "$d/${cleanName}"; return "ERR_NOTFOUND" unless -f $f; my $sz = (stat($f))[7] || 0; return "ERR_TOO_LARGE:$sz" if $sz > 67108864; open(my $fh, "<:raw", $f) or return "ERR_OPEN:$!"; local $/; my $raw = <$fh>; close($fh); return "B64:" . MIME::Base64::encode_base64($raw, ""); }`;
+    const res = await executeFhemCommand(
+      {...config, timeoutMs: Math.max(config.timeoutMs, 60_000)},
+      perlCmd
+    );
+    if (!res.ok) {
+      return {ok: false, errorMessage: res.errorMessage || 'Backup konnte nicht geladen werden.'};
+    }
+    const body = (res.data || '').trim();
+    if (body === 'ERR_NOTFOUND') {
+      return {ok: false, errorMessage: `Backup-Datei „${cleanName}“ wurde auf dem FHEM-Server nicht gefunden.`};
+    }
+    if (body.startsWith('ERR_TOO_LARGE:')) {
+      return {
+        ok: false,
+        errorMessage: 'Die Backup-Datei überschreitet das 64-MB-Limit für den Browser-Download.',
+      };
+    }
+    if (!body.startsWith('B64:')) {
+      return {
+        ok: false,
+        errorMessage: 'Der FHEM-Server hat keine Archivdaten geliefert (ggf. blockiert allowedCommands Perl-Befehle).',
+      };
+    }
+    const bytes = decodeBase64ToUint8Array(body.slice(4));
+    const blob = new Blob([bytes as unknown as BlobPart], {type: 'application/gzip'});
+    triggerBrowserFileDownload(blob, cleanName);
+    return {ok: true, sizeBytes: blob.size};
+  }
+
+  // 3. Server-Proxy & Exclusive FHEM-Stack Mode (/api/fhem/backup-download)
+  try {
+    const sessionToken = getActiveSessionToken();
+    const response = await fetch('/api/fhem/backup-download', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'FHEM-Control-Desk',
+        ...(sessionToken ? {'X-Session-Token': sessionToken} : {}),
+      },
+      body: JSON.stringify(
+        config.useServerUpstream
+          ? {
+              useServerUpstream: true,
+              filename: cleanName,
+              timeoutMs: Math.max(config.timeoutMs, 60_000),
+            }
+          : {
+              filename: cleanName,
+              protocol: config.protocol,
+              host: config.host,
+              port: config.port,
+              basePath: config.basePath,
+              httpMethod: config.httpMethod,
+              csrfMode: config.csrfMode,
+              csrfToken: config.csrfMode === 'manual' ? config.csrfToken : '',
+              authType: config.authType,
+              username: config.authType === 'basic' ? config.username : '',
+              password: config.authType === 'basic' ? config.password : '',
+              apiKey: config.authType === 'apikey' ? config.apiKey : '',
+              customHeaderName: config.authType === 'custom_header' ? config.customHeaderName : '',
+              customHeaderValue: config.authType === 'custom_header' ? config.customHeaderValue : '',
+              queryTokenParam: config.authType === 'query_token' ? config.queryTokenParam : '',
+              queryTokenValue: config.authType === 'query_token' ? config.queryTokenValue : '',
+              acceptSelfSigned: config.acceptSelfSigned,
+              timeoutMs: Math.max(config.timeoutMs, 60_000),
+            }
+      ),
+    });
+
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    if (!response.ok || contentType.includes('application/json')) {
+      let message = `Download fehlgeschlagen (HTTP ${response.status}).`;
+      try {
+        const errJson = (await response.json()) as {message?: string};
+        if (errJson.message) message = errJson.message;
+      } catch {
+        // ignore JSON parse error
+      }
+      return {ok: false, errorMessage: message};
+    }
+
+    const blob = await response.blob();
+    if (blob.size === 0) {
+      return {ok: false, errorMessage: 'Die heruntergeladene Backup-Datei war leer.'};
+    }
+
+    triggerBrowserFileDownload(blob, cleanName);
+    return {ok: true, sizeBytes: blob.size};
+  } catch {
+    return {
+      ok: false,
+      errorMessage: 'Download-Proxy nicht erreichbar. Prüfe die Verbindung zum FHEM Control Desk Server.',
+    };
+  }
+}
+
 

@@ -9,7 +9,9 @@
 
 services:
   fhem-control-desk:
-    build: .
+    image: "${FHEM_DESK_IMAGE:-ghcr.io/jbkunama1/hai.fhemcontroldesk:latest}"
+    # Optional zum lokalen Selberbauen statt GHCR-Image:
+    # build: .
     container_name: fhem-control-desk
     restart: unless-stopped
     ports:

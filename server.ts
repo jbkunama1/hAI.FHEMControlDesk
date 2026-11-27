@@ -399,6 +399,7 @@ function executeFhemHttpRequest(options: {
   headers: Record<string, string>;
   acceptSelfSigned: boolean;
   timeoutMs: number;
+  maxResponseBytes?: number;
 }): Promise<{
   statusCode: number;
   body: string;
@@ -410,6 +411,7 @@ function executeFhemHttpRequest(options: {
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
     const isHttps = options.protocol === 'https';
+    const responseLimit = options.maxResponseBytes ?? MAX_RESPONSE_BYTES;
 
     const reqHeaders: Record<string, string> = {...options.headers};
     let payloadBuf: Buffer | undefined;
@@ -441,7 +443,7 @@ function executeFhemHttpRequest(options: {
 
       res.on('data', (chunk: Buffer) => {
         totalBytes += chunk.length;
-        if (totalBytes > MAX_RESPONSE_BYTES) {
+        if (totalBytes > responseLimit) {
           req.destroy(new Error('RESPONSE_TOO_LARGE'));
           return;
         }
@@ -1442,6 +1444,334 @@ async function createApp() {
         ok: false,
         errorCode: 'NETWORK_ERROR',
         message: 'Netzwerkfehler bei der Kommunikation mit dem FHEM-Server.',
+      });
+    }
+  });
+
+  // Strict backup filename allowlist: basename only, no path separators, no '..' or Perl/header metacharacters
+  const isSafeBackupFilename = (value: string): boolean => {
+    if (!value || value.length > 170) return false;
+    if (value.startsWith('.') || value.includes('..')) return false;
+    return /^[A-Za-z0-9._-]{1,160}\.(tar\.gz|tgz|tar|zip|gz)$/i.test(value);
+  };
+
+  const getBackupMimeType = (filename: string): string => {
+    const lower = filename.toLowerCase();
+    if (lower.endsWith('.zip')) return 'application/zip';
+    if (lower.endsWith('.tar')) return 'application/x-tar';
+    return 'application/gzip';
+  };
+
+  const tryDirectFhemBackupDownload = (options: {
+    protocol: 'http' | 'https';
+    host: string;
+    port: number;
+    pathWithQuery: string;
+    headers: Record<string, string>;
+    acceptSelfSigned: boolean;
+    timeoutMs: number;
+    maxBytes: number;
+  }): Promise<Buffer | null> => {
+    return new Promise((resolve) => {
+      const isHttps = options.protocol === 'https';
+      const transport = isHttps ? https : http;
+      const req = transport.request(
+        {
+          protocol: `${options.protocol}:`,
+          hostname: options.host,
+          port: options.port,
+          path: options.pathWithQuery,
+          method: 'GET',
+          headers: {...options.headers, Accept: 'application/gzip, application/octet-stream, */*'},
+          timeout: options.timeoutMs,
+          ...(isHttps ? {rejectUnauthorized: !options.acceptSelfSigned} : {}),
+        },
+        (upstreamRes) => {
+          const status = upstreamRes.statusCode || 0;
+          const rawCt = upstreamRes.headers['content-type'];
+          const ct = (Array.isArray(rawCt) ? rawCt[0] : rawCt || '').toLowerCase();
+          if (status !== 200 || ct.includes('text/html') || ct.includes('text/plain')) {
+            upstreamRes.resume();
+            resolve(null);
+            return;
+          }
+          const chunks: Buffer[] = [];
+          let total = 0;
+          let aborted = false;
+          upstreamRes.on('data', (chunk: Buffer) => {
+            total += chunk.length;
+            if (total > options.maxBytes) {
+              aborted = true;
+              req.destroy();
+              resolve(null);
+              return;
+            }
+            chunks.push(chunk);
+          });
+          upstreamRes.on('end', () => {
+            if (aborted || total === 0) {
+              resolve(null);
+              return;
+            }
+            const buf = Buffer.concat(chunks);
+            // Reject accidental HTML error responses even if mislabeled
+            const headText = buf.subarray(0, 64).toString('utf8').trimStart().toLowerCase();
+            if (headText.startsWith('<!doctype') || headText.startsWith('<html')) {
+              resolve(null);
+              return;
+            }
+            resolve(buf);
+          });
+          upstreamRes.on('error', () => resolve(null));
+        }
+      );
+      req.on('timeout', () => {
+        req.destroy();
+        resolve(null);
+      });
+      req.on('error', () => resolve(null));
+      req.end();
+    });
+  };
+
+  // Secure FHEM Server Backup Archive Download (.tar.gz / .tgz / .tar / .zip / .gz)
+  app.post('/api/fhem/backup-download', async (req, res) => {
+    if (!requireAppHeader(req, res)) return;
+    if (!(await requireAuthenticatedIfEnabled(req, res))) return;
+
+    const body = (req.body || {}) as FhemExecuteBody & {filename?: string};
+    const filename = typeof body.filename === 'string' ? body.filename.trim() : '';
+    if (!isSafeBackupFilename(filename)) {
+      res.status(400).json({
+        ok: false,
+        errorCode: 'INVALID_FILENAME',
+        message: 'Ungültiger Backup-Dateiname (nur Archivdateien ohne Pfadangaben erlaubt).',
+      });
+      return;
+    }
+
+    const validated = await resolveEffectiveFhemConnection(body);
+    if (!validated.ok) {
+      res.status(validated.status).json({
+        ok: false,
+        errorCode: validated.errorCode,
+        message: validated.message,
+      });
+      return;
+    }
+
+    const {
+      protocol,
+      host,
+      port,
+      basePath,
+      httpMethod,
+      csrfMode,
+      manualCsrfToken,
+      timeoutMs,
+      acceptSelfSigned,
+      queryTokenPair,
+      headers,
+    } = validated.conn;
+
+    const downloadTimeoutMs = Math.max(timeoutMs, 60_000);
+    const MAX_DIRECT_BACKUP_BYTES = 128 * 1024 * 1024; // 128 MB direct HTTP cap
+    const MAX_PERL_B64_RESPONSE_BYTES = 92 * 1024 * 1024; // ~64 MB binary encoded as Base64
+
+    const sendArchiveBuffer = (buf: Buffer) => {
+      res.status(200);
+      res.setHeader('Content-Type', getBackupMimeType(filename));
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.setHeader('Content-Length', String(buf.byteLength));
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.send(buf);
+    };
+
+    try {
+      // Strategy 1: Direct binary HTTP path (if exposed via HTTPSRV or FHEMWEB www/backup symlink)
+      const directQuery = queryTokenPair
+        ? `?${encodeURIComponent(queryTokenPair[0])}=${encodeURIComponent(queryTokenPair[1])}`
+        : '';
+      const directPath = `${basePath.replace(/\/+$/, '')}/backup/${encodeURIComponent(filename)}${directQuery}`;
+      const directBuf = await tryDirectFhemBackupDownload({
+        protocol,
+        host,
+        port,
+        pathWithQuery: directPath,
+        headers,
+        acceptSelfSigned,
+        timeoutMs: Math.min(downloadTimeoutMs, 25_000),
+        maxBytes: MAX_DIRECT_BACKUP_BYTES,
+      });
+      if (directBuf) {
+        sendArchiveBuffer(directBuf);
+        return;
+      }
+
+      // Strategy 2: Universal read-only FHEM Perl binary reader (zero shell invocation, respects attr global backupdir)
+      // Safe because `filename` is strictly validated against /^[A-Za-z0-9._-]+\.(tar\.gz|tgz|tar|zip|gz)$/i above.
+      const perlCmd = `{ require MIME::Base64; my $d = AttrVal("global","backupdir","./backup"); my $f = "$d/${filename}"; return "ERR_NOTFOUND" unless -f $f; my $sz = (stat($f))[7] || 0; return "ERR_TOO_LARGE:$sz" if $sz > 67108864; open(my $fh, "<:raw", $f) or return "ERR_OPEN:$!"; local $/; my $raw = <$fh>; close($fh); return "B64:" . MIME::Base64::encode_base64($raw, ""); }`;
+
+      const buildParamsString = (token: string) => {
+        const queryParts = [`cmd=${encodeURIComponent(perlCmd)}`, 'XHR=1'];
+        if (token) {
+          queryParts.push(`fwcsrf=${encodeURIComponent(token)}`);
+        }
+        if (queryTokenPair) {
+          queryParts.push(`${encodeURIComponent(queryTokenPair[0])}=${encodeURIComponent(queryTokenPair[1])}`);
+        }
+        return queryParts.join('&');
+      };
+
+      const sendWithToken = (token: string) => {
+        const paramsStr = buildParamsString(token);
+        return executeFhemHttpRequest({
+          protocol,
+          host,
+          port,
+          method: httpMethod,
+          pathWithQuery: httpMethod === 'POST' ? basePath : `${basePath}?${paramsStr}`,
+          bodyPayload: httpMethod === 'POST' ? paramsStr : undefined,
+          headers,
+          acceptSelfSigned,
+          timeoutMs: downloadTimeoutMs,
+          maxResponseBytes: MAX_PERL_B64_RESPONSE_BYTES,
+        });
+      };
+
+      let result = await sendWithToken(manualCsrfToken);
+      const rawAutoToken = (result.csrfTokenHeader || '').trim();
+      const isValidAutoToken =
+        rawAutoToken.length > 0 &&
+        rawAutoToken.length <= 128 &&
+        rawAutoToken.toLowerCase() !== 'none' &&
+        !/[\r\n\s]/.test(rawAutoToken);
+
+      if (csrfMode === 'auto' && (result.statusCode === 400 || result.statusCode === 403)) {
+        let retryToken = isValidAutoToken ? rawAutoToken : '';
+        if (!retryToken) {
+          const probe = await executeFhemHttpRequest({
+            protocol,
+            host,
+            port,
+            method: 'GET',
+            pathWithQuery: `${basePath}?XHR=1`,
+            headers,
+            acceptSelfSigned,
+            timeoutMs: Math.min(timeoutMs, 5000),
+          });
+          const probeTok = (probe.csrfTokenHeader || '').trim();
+          if (
+            probeTok.length > 0 &&
+            probeTok.length <= 128 &&
+            probeTok.toLowerCase() !== 'none' &&
+            !/[\r\n\s]/.test(probeTok)
+          ) {
+            retryToken = probeTok;
+          }
+        }
+        if (retryToken) {
+          result = await sendWithToken(retryToken);
+        }
+      }
+
+      if (result.statusCode === 401) {
+        res.status(401).json({
+          ok: false,
+          errorCode: 'AUTH_FAILED',
+          message: 'FHEM-Authentifizierung fehlgeschlagen (HTTP 401).',
+        });
+        return;
+      }
+      if (result.statusCode === 400 || result.statusCode === 403) {
+        res.status(403).json({
+          ok: false,
+          errorCode: isValidAutoToken ? 'CSRF_REQUIRED' : 'ACCESS_DENIED',
+          message: `FHEMWEB hat den Download abgelehnt (HTTP ${result.statusCode}).`,
+        });
+        return;
+      }
+      if (result.statusCode < 200 || result.statusCode >= 300) {
+        res.status(502).json({
+          ok: false,
+          errorCode: 'HTTP_ERROR',
+          message: `FHEM-Server antwortete mit HTTP ${result.statusCode}.`,
+        });
+        return;
+      }
+
+      const trimmedBody = result.body.trim();
+      if (trimmedBody === 'ERR_NOTFOUND') {
+        res.status(404).json({
+          ok: false,
+          errorCode: 'BACKUP_NOT_FOUND',
+          message: `Backup-Datei „${filename}“ wurde auf dem FHEM-Server nicht gefunden.`,
+        });
+        return;
+      }
+      if (trimmedBody.startsWith('ERR_TOO_LARGE:')) {
+        const bytes = Number(trimmedBody.slice('ERR_TOO_LARGE:'.length)) || 0;
+        const mb = bytes > 0 ? ` (${(bytes / (1024 * 1024)).toFixed(1)} MB)` : '';
+        res.status(413).json({
+          ok: false,
+          errorCode: 'BACKUP_TOO_LARGE',
+          message: `Die Backup-Datei${mb} überschreitet das 64-MB-Direktdownload-Limit über FHEMWEB. Lade große Archive bitte per SSH/SCP oder HTTPSRV herunter.`,
+        });
+        return;
+      }
+      if (trimmedBody.startsWith('ERR_OPEN:')) {
+        res.status(403).json({
+          ok: false,
+          errorCode: 'BACKUP_UNREADABLE',
+          message: 'FHEM konnte die Backup-Datei nicht lesen (Dateiberechtigungen prüfen).',
+        });
+        return;
+      }
+      if (!trimmedBody.startsWith('B64:')) {
+        res.status(422).json({
+          ok: false,
+          errorCode: 'DOWNLOAD_UNSUPPORTED',
+          message:
+            'Der FHEM-Server hat keine Archivdaten geliefert (ggf. blockiert allowedCommands Perl-Befehle oder MIME::Base64 fehlt).',
+        });
+        return;
+      }
+
+      const b64Payload = trimmedBody.slice(4).replace(/\s+/g, '');
+      const archiveBuf = Buffer.from(b64Payload, 'base64');
+      if (archiveBuf.byteLength === 0) {
+        res.status(502).json({
+          ok: false,
+          errorCode: 'EMPTY_ARCHIVE',
+          message: 'Das heruntergeladene Backup-Archiv war leer.',
+        });
+        return;
+      }
+
+      sendArchiveBuffer(archiveBuf);
+    } catch (err: unknown) {
+      const error = err as NodeJS.ErrnoException;
+      if (error.message === 'RESPONSE_TOO_LARGE') {
+        res.status(413).json({
+          ok: false,
+          errorCode: 'BACKUP_TOO_LARGE',
+          message: 'Die Backup-Datei überschreitet das Download-Limit.',
+        });
+        return;
+      }
+      if (error.code === 'ETIMEDOUT' || error.message === 'REQUEST_TIMEOUT') {
+        res.status(504).json({
+          ok: false,
+          errorCode: 'TIMEOUT',
+          message: 'Zeitüberschreitung beim Herunterladen der Backup-Datei vom FHEM-Server.',
+        });
+        return;
+      }
+      res.status(502).json({
+        ok: false,
+        errorCode: 'DOWNLOAD_FAILED',
+        message: 'Backup konnte nicht vom FHEM-Server heruntergeladen werden.',
       });
     }
   });

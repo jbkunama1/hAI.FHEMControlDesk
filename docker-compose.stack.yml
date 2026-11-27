@@ -1,9 +1,10 @@
 # ==============================================================================
 # FHEM Control Desk – Komplett-Stack (Neuer FHEM-Server + Exklusive WebUI)
 # ==============================================================================
-# Starten mit:
+# Starten mit (zieht das fertige GHCR-Image, kein lokaler Build nötig):
 #   cp .env.example .env
-#   docker compose -f docker-compose.stack.yml up -d --build
+#   docker compose -f docker-compose.stack.yml pull
+#   docker compose -f docker-compose.stack.yml up -d
 #
 # Architektur-Vorteil ("Exklusive WebUI"):
 # - Der klassische FHEMWEB-Port 8083 wird NICHT nach außen veröffentlicht!
@@ -38,7 +39,9 @@ services:
       - fhem_internal
 
   fhem-control-desk:
-    build: .
+    image: "${FHEM_DESK_IMAGE:-ghcr.io/jbkunama1/hai.fhemcontroldesk:latest}"
+    # Optional zum lokalen Selberbauen statt GHCR-Image:
+    # build: .
     container_name: fhem-control-desk
     restart: unless-stopped
     depends_on:
