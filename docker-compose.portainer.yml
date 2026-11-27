@@ -7,14 +7,65 @@ services:
     restart: unless-stopped
     ports:
       - "${HOST_PORT:-3000}:3000"
+    extra_hosts:
+      # Ermöglicht Zugriff auf natives FHEM auf demselben Linux-Host via "host.docker.internal"
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Persistenter Speicher für Benutzerkonten, Sessions und synchronisierte Profile
+      - fhem_desk_data:/app/data
     environment:
       NODE_ENV: production
       PORT: 3000
-      FHEM_ALLOWED_HOSTS: ${FHEM_ALLOWED_HOSTS:-192.168.178.50}
-      FHEM_HEALTH_HOST: ${FHEM_HEALTH_HOST:-}
-      FHEM_HEALTH_PORT: ${FHEM_HEALTH_PORT:-8083}
-      AI_ALLOWED_HOSTS: ${AI_ALLOWED_HOSTS:-}
-      AI_BASE_URL: ${AI_BASE_URL:-}
-      AI_API_KEY: ${AI_API_KEY:-}
-      AI_MODEL: ${AI_MODEL:-}
-      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATA_DIR: /app/data
+      TZ: "${TZ:-Europe/Berlin}"
+
+      # ------------------------------------------------------------------------
+      # Exklusive WebUI / Server-Managed FHEM-Stack-Modus (empfohlen)
+      # ------------------------------------------------------------------------
+      # Beispiele: http://fhem:8083/fhem | http://host.docker.internal:8083/fhem | http://192.168.178.50:8083/fhem
+      FHEM_UPSTREAM_URL: "${FHEM_UPSTREAM_URL:-}"
+      FHEM_EXCLUSIVE_MODE: "${FHEM_EXCLUSIVE_MODE:-true}"
+      FHEM_UPSTREAM_CSRF_MODE: "${FHEM_UPSTREAM_CSRF_MODE:-auto}"
+      FHEM_UPSTREAM_CSRF_TOKEN: "${FHEM_UPSTREAM_CSRF_TOKEN:-}"
+      FHEM_UPSTREAM_METHOD: "${FHEM_UPSTREAM_METHOD:-GET}"
+      FHEM_UPSTREAM_AUTH_TYPE: "${FHEM_UPSTREAM_AUTH_TYPE:-}"
+      FHEM_UPSTREAM_USER: "${FHEM_UPSTREAM_USER:-}"
+      FHEM_UPSTREAM_PASS: "${FHEM_UPSTREAM_PASS:-}"
+      FHEM_UPSTREAM_API_KEY: "${FHEM_UPSTREAM_API_KEY:-}"
+      FHEM_UPSTREAM_HEADER_NAME: "${FHEM_UPSTREAM_HEADER_NAME:-}"
+      FHEM_UPSTREAM_HEADER_VALUE: "${FHEM_UPSTREAM_HEADER_VALUE:-}"
+      FHEM_UPSTREAM_QUERY_PARAM: "${FHEM_UPSTREAM_QUERY_PARAM:-}"
+      FHEM_UPSTREAM_QUERY_VALUE: "${FHEM_UPSTREAM_QUERY_VALUE:-}"
+      FHEM_UPSTREAM_ACCEPT_SELF_SIGNED: "${FHEM_UPSTREAM_ACCEPT_SELF_SIGNED:-false}"
+
+      # Fallback-Allowlist (nur nötig, wenn FHEM_UPSTREAM_URL leer ist oder FHEM_EXCLUSIVE_MODE=false)
+      FHEM_ALLOWED_HOSTS: "${FHEM_ALLOWED_HOSTS:-192.168.178.50}"
+
+      # ------------------------------------------------------------------------
+      # Sicherheit, Login & Benutzerkonten
+      # ------------------------------------------------------------------------
+      REQUIRE_LOGIN: "${REQUIRE_LOGIN:-true}"
+      ADMIN_BOOTSTRAP_TOKEN: "${ADMIN_BOOTSTRAP_TOKEN:-}"
+      APP_AUTH_USER: "${APP_AUTH_USER:-}"
+      APP_AUTH_PASS: "${APP_AUTH_PASS:-}"
+
+      # Optional: KI-Assistent & Healthcheck
+      AI_ALLOWED_HOSTS: "${AI_ALLOWED_HOSTS:-}"
+      AI_BASE_URL: "${AI_BASE_URL:-}"
+      AI_API_KEY: "${AI_API_KEY:-}"
+      AI_MODEL: "${AI_MODEL:-}"
+      FHEM_HEALTH_HOST: "${FHEM_HEALTH_HOST:-}"
+      FHEM_HEALTH_PORT: "${FHEM_HEALTH_PORT:-8083}"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+
+    # Optional: Mit einem bereits existierenden FHEM-Docker-Netzwerk verbinden:
+    # networks:
+    #   - existing_fhem_net
+
+volumes:
+  fhem_desk_data:
+
+# networks:
+#   existing_fhem_net:
+#     external: true
+#     name: fhem_default
